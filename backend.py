@@ -32,6 +32,10 @@ REPOS = {
     "distilled": os.environ.get("KLEIN_MODEL_ID", "black-forest-labs/flux-3-image-klein"),
     "base": os.environ.get("KLEIN_BASE_MODEL_ID", "black-forest-labs/flux-3-image-klein-base"),
 }
+# Текстовый энкодер (Qwen3-VL-4B-Instruct): по умолчанию — его версия, обработанная Heretic (аблитерация отказов,
+# https://github.com/p-e-w/heretic): та же архитектура и токенизатор, но без направления «отказа» в скрытых
+# состояниях, которые и уходят в трансформер. Пустая строка — оригинальный энкодер из репозитория Klein.
+TEXT_ENCODER_ID = os.environ.get("KLEIN_TEXT_ENCODER_ID", "DreamFast/Qwen3-VL-4b-Heretic")
 MODEL_LABELS = {
     "distilled": "Klein · Distilled (16 шагов, быстро)",
     "base": "Klein · Base (50 шагов, CFG, negative)",
@@ -124,10 +128,35 @@ def flatten_alpha(image: Image.Image) -> Image.Image:
     return image.convert("RGB")
 
 
+# Предел площади референса — как в коде BFL (`flux3/pipeline.py`): единственный — до 4 MP, в композиции из
+# нескольких — каждый до 1 MP. Diffusers пропускает до 16 MP, и фото с телефона (12 MP) раздувает число токенов
+# трансформера в разы: шаг становится в несколько раз дольше, а модель обучали не на таких.
+SINGLE_REFERENCE_MAX_PIXELS = 4 * 1024 * 1024
+MULTI_REFERENCE_MAX_PIXELS = 1024 * 1024
+
+
+def fit_references(images: list[Image.Image]) -> list[Image.Image]:
+    limit = SINGLE_REFERENCE_MAX_PIXELS if len(images) == 1 else MULTI_REFERENCE_MAX_PIXELS
+    fitted = []
+    for image in images:
+        if image.width * image.height > limit:
+            k = math.sqrt(limit / (image.width * image.height))
+            image = image.resize((max(1, int(image.width * k)), max(1, int(image.height * k))),
+                                 Image.Resampling.LANCZOS)
+        fitted.append(image)
+    return fitted
+
+
 # Выше этого (ширина × высота × число картинок) на картах < 40 GB VAE сразу декодирует тайлами:
 # иначе OOM случится после всего денойзинга, и генерацию придётся повторять.
 TILE_UPFRONT_PIXELS = 2048 * 2048
 SHARED_COMPONENTS = ("text_encoder", "vae")
+GB = 2**30
+# Запас видеопамяти под активации (замерено на RTX 3090, bf16): трансформер — постоянная часть плюс на каждый
+# мегапиксель токенов (вывод × число картинок + референсы); VAE в fp32 — на мегапиксель декодируемого кадра.
+TRANSFORMER_RESERVE = (2.2 * GB, 0.65 * GB)
+VAE_DECODE_PER_MP = 4.2 * GB
+VAE_TILED_RESERVE = 2.5 * GB
 
 
 class KleinBackend:
@@ -135,22 +164,17 @@ class KleinBackend:
 
     def __init__(self) -> None:
         import torch
-        from diffusers import ComponentsManager
+
+        from vram import VramPool
 
         self._torch = torch
         self._lock = threading.RLock()
         self.vram_gb = torch.cuda.get_device_properties(0).total_memory / 2**30
-        offload = os.environ.get("KLEIN_OFFLOAD", "auto")
-        if offload == "auto":
-            # Веса bf16: трансформер 11 GB, энкодер Qwen3-VL-4B 8 GB, апсемплер 19 GB, VAE 0.3 GB.
-            # От 48 GB всё помещается сразу; меньше — менеджер держит в видеопамяти то, что влезает,
-            # а остальное выгружает в RAM (на 24 GB апсемплер на время работы вытесняет трансформер и энкодер).
-            offload = "none" if self.vram_gb >= 46 else "auto"
-        self.offload = offload
-        self.manager = ComponentsManager() if offload == "auto" else None
-        # Сколько видеопамяти менеджер оставляет свободной под активации, решая, что выгрузить. На 24 GB с 6 GB
-        # энкодер на время денойзинга уходит в RAM (+1–3 с), зато 2K–4K не падают в OOM; с 4 GB он остаётся.
-        self.memory_margin = os.environ.get("KLEIN_MEMORY_MARGIN") or ("6GB" if self.vram_gb < 32 else "4GB")
+        # Веса bf16: трансформер 11 GB, энкодер Qwen3-VL-4B 8 GB, апсемплер 19 GB, VAE 0.3 GB. Все живут в
+        # закреплённой RAM, на карте — то, что нужно сейчас (см. vram.py). От 48 GB помещается всё сразу, на 24 GB
+        # трансформер с энкодером на 1 MP живут на карте вместе, а апсемплер на время работы вытесняет обоих.
+        self.pool = VramPool("cuda", pin=os.environ.get("KLEIN_PIN_MEMORY", "1") != "0")
+        self.pool.set_reserve("text_encoder", 1 * GB)
         self.fp8_storage = os.environ.get("KLEIN_FP8_STORAGE") == "1"
 
         self.pipes: dict = {}
@@ -162,8 +186,9 @@ class KleinBackend:
             self._load_model("base")
 
         gpu = torch.cuda.get_device_name(0)
-        self.description = (f"{gpu} ({self.vram_gb:.0f} GB) · offload: "
-                            f"{f'авто, запас {self.memory_margin}' if self.manager else 'нет'}"
+        self.description = (f"{gpu} ({self.vram_gb:.0f} GB) · энкодер: {TEXT_ENCODER_ID or 'оригинальный'} · "
+                            f"модели подгружаются из "
+                            f"{'закреплённой ' if self.pool.pin else ''}RAM по требованию"
                             + (" · трансформер в FP8 (хранение)" if self.fp8_storage else ""))
 
     # ------------------------------------------------------------------ #
@@ -186,10 +211,21 @@ class KleinBackend:
         started = time.time()
         blocks = ModularPipeline.from_pretrained(repo).blocks
         blocks.sub_blocks.pop("prompt_upsampler", None)
-        pipe = blocks.init_pipeline(repo, components_manager=self.manager)
+        pipe = blocks.init_pipeline(repo)
         donor = next(iter(self.pipes.values()), None)
         if donor is None:
-            pipe.load_components(dtype={"vae": torch.float32, "default": torch.bfloat16})
+            dtype = {"vae": torch.float32, "default": torch.bfloat16}
+            if TEXT_ENCODER_ID:
+                names = [n for n, spec in pipe._component_specs.items()
+                         if spec.default_creation_method == "from_pretrained" and n != "text_encoder"]
+                pipe.load_components(names=names, dtype=dtype)
+                pipe.update_components(text_encoder=load_text_encoder(TEXT_ENCODER_ID))
+            else:
+                pipe.load_components(dtype=dtype)
+            # VAE маленький (0.3 GB) и вызывается не через forward — держим его на карте всегда.
+            pipe.vae.to("cuda")
+            self._guard_vae(pipe.vae)
+            self.pool.register(pipe.text_encoder, "text_encoder")
         else:
             # Энкодер и VAE у Base и Distilled одинаковые — второй раз их не грузим.
             names = [n for n, spec in pipe._component_specs.items()
@@ -200,16 +236,32 @@ class KleinBackend:
             # Веса трансформера хранятся в FP8 (5.6 GB вместо 11), считаются в bf16 — работает и на Ampere.
             pipe.transformer.enable_layerwise_casting(storage_dtype=torch.float8_e4m3fn,
                                                       compute_dtype=torch.bfloat16)
-        if self.manager is not None:
-            # Менеджер запоминает компоненты при включении — после новой модели включаем заново.
-            self.manager.disable_auto_cpu_offload()
-            self.manager.enable_auto_cpu_offload(device="cuda", memory_reserve_margin=self.memory_margin)
-        else:
-            pipe.to("cuda")
+        self.pool.register(pipe.transformer, f"transformer_{model}")
         self.pipes[model] = pipe
         self._loaded_loras[model] = set()
         print(f"[backend] {repo} готов за {time.time() - started:.0f} с")
         return pipe
+
+    def _guard_vae(self, vae) -> None:
+        """VAE вызывают мимо forward (`encode` / `decode`), хук пула его не видит: перед вызовом освобождаем
+        место под его активации — при нехватке с карты уйдёт энкодер, а не случится OOM в конце генерации."""
+        factor = 2 ** (len(vae.config.block_out_channels) - 1)
+
+        def guarded(fn, pixels):
+            def call(x, *args, **kwargs):
+                need = VAE_TILED_RESERVE if vae.use_tiling else pixels(x) / 1e6 * VAE_DECODE_PER_MP
+                self.pool.make_room(int(need))
+                return fn(x, *args, **kwargs)
+            return call
+
+        vae.encode = guarded(vae.encode, lambda x: x.shape[0] * x.shape[-2] * x.shape[-1])
+        vae.decode = guarded(vae.decode, lambda z: z.shape[0] * z.shape[-2] * z.shape[-1] * factor**2)
+
+    def _transformer_reserve(self, req: GenRequest) -> int:
+        width, height = req.resolved_size()
+        tokens_mp = (width * height * req.num_images + sum(im.width * im.height for im in req.images)) / 1e6
+        fixed, per_mp = TRANSFORMER_RESERVE
+        return int(fixed + per_mp * tokens_mp)
 
     def ensure_model(self, model: str) -> None:
         with self._lock:
@@ -294,6 +346,7 @@ class KleinBackend:
 
             width, height = req.resolved_size()
             tile_upfront = self.vram_gb < 40 and width * height * req.num_images > TILE_UPFRONT_PIXELS
+            self.pool.set_reserve(f"transformer_{req.model}", self._transformer_reserve(req))
             self._on_step = on_step
             try:
                 with torch.inference_mode():
@@ -302,7 +355,10 @@ class KleinBackend:
                             return self._run(pipe, kwargs, req.seed)
                         except torch.OutOfMemoryError as e:
                             self._release(e)
+                            # Оценка запаса не угадала — повторяем с одним трансформером на карте.
+                            self.pool.unload_all(keep=pipe.transformer)
                             calls[0] = 0
+                            print(f"[backend] OOM на {width}×{height} — повтор с VAE тайлами", flush=True)
                             if progress:
                                 progress(0, "Не хватило видеопамяти — повтор с декодированием VAE тайлами")
                     pipe.vae.enable_tiling()
@@ -326,6 +382,14 @@ class KleinBackend:
         traceback.clear_frames(exc.__traceback__)
         gc.collect()
         self._torch.cuda.empty_cache()
+
+
+def load_text_encoder(repo: str):
+    import torch
+    from transformers import Qwen3VLForConditionalGeneration
+
+    print(f"[backend] текстовый энкодер: {repo}")
+    return Qwen3VLForConditionalGeneration.from_pretrained(repo, dtype=torch.bfloat16)
 
 
 def resolve_lora_source(source: str) -> tuple[str, str | None]:

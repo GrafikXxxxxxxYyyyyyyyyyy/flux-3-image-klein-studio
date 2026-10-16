@@ -33,6 +33,7 @@ SERVER_URL = os.environ.get("KLEIN_UPSAMPLER_URL", "")
 SERVER_MODEL = os.environ.get("KLEIN_UPSAMPLER_NAME", PUP_REPO)
 DEFAULT_MAX_NEW_TOKENS = 3584
 CACHE_SIZE = 64
+UPSAMPLER_RESERVE_GB = 2.5  # KV-кэш и активации; с 10 референсами токенов картинок больше всего
 
 
 class PromptUpsampler:
@@ -97,13 +98,9 @@ class PromptUpsampler:
                 print(f"[upsampler] загрузка {PUP_REPO}…")
                 repo = next(iter(_repos_with(backend)))
                 blocks = ModularPipeline.from_pretrained(repo).blocks.sub_blocks["prompt_upsampler"]
-                pipe = blocks.init_pipeline(repo, components_manager=backend.manager)
+                pipe = blocks.init_pipeline(repo)
                 pipe.load_components(dtype=torch.bfloat16)
-                if backend.manager is not None:
-                    backend.manager.disable_auto_cpu_offload()
-                    backend.manager.enable_auto_cpu_offload(device="cuda", memory_reserve_margin=backend.memory_margin)
-                else:
-                    pipe.to("cuda")
+                backend.pool.register(pipe.prompt_upsampler, "prompt_upsampler")
                 self._pipe = pipe
             kwargs = dict(prompt=request, max_new_tokens=int(max_new_tokens))
             if images:
@@ -111,11 +108,8 @@ class PromptUpsampler:
             if boxes:
                 kwargs["boxes"] = boxes
             with torch.inference_mode():
-                model = self._pipe.prompt_upsampler
-                if backend.manager is not None and model.device.type != "cuda":
-                    # Хук менеджера переносит модель на GPU только в forward, а generate() готовит входы на
-                    # устройстве модели заранее — прогреваем одним токеном, чтобы вся генерация шла на GPU.
-                    model(input_ids=torch.ones((1, 1), dtype=torch.long, device="cuda"))
+                # generate() готовит входы на устройстве модели ещё до первого forward — кладём её на карту заранее.
+                backend.pool.load(self._pipe.prompt_upsampler, reserve=int(UPSAMPLER_RESERVE_GB * 2**30))
                 return self._pipe(**kwargs, output="prompt")
 
     def _server(self, request, images, boxes, max_new_tokens) -> str:

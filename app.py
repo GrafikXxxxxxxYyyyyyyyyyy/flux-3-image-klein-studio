@@ -24,6 +24,7 @@ import gradio as gr
 from PIL import Image
 from PIL.PngImagePlugin import PngInfo
 
+import box_editor
 import layout
 from backend import (
     ASPECT_RATIOS,
@@ -36,9 +37,11 @@ from backend import (
     MODEL_LABELS,
     REPOS,
     SIZE_MULTIPLE,
+    TEXT_ENCODER_ID,
     TIERS,
     GenRequest,
     clamp_size,
+    fit_references,
     flatten_alpha,
     load_backend,
     parse_ratio,
@@ -54,6 +57,8 @@ SLIDER_MAX_SIDE = 4096
 HISTORY_LIMIT = 120
 # own — каждый видит только свои генерации (по id браузера), all — общая лента всех пользователей.
 HISTORY_MODE = os.environ.get("KLEIN_HISTORY", "own")
+# Галочка «✨ Апсемплер» по умолчанию снята: он добавляет ~15–18 с к каждому новому промпту.
+UPSAMPLE_DEFAULT = os.environ.get("KLEIN_UPSAMPLE_DEFAULT") == "1"
 POLL_SECONDS = 0.5
 
 SIZE_REF = "Как у изображения №"
@@ -144,7 +149,8 @@ def make_job(client, request: str, images: list[Image.Image], boxes, upsample: b
     if len(images) > MAX_REFERENCE_IMAGES:
         raise gr.Error(f"Модель принимает не больше {MAX_REFERENCE_IMAGES} изображений, загружено {len(images)}")
     upsample = bool(upsample) and upsampler.enabled
-    job = Job(owner=client or "anon", request=request.strip(), images=[flatten_alpha(im) for im in images],
+    images = fit_references([flatten_alpha(im) for im in images])
+    job = Job(owner=client or "anon", request=request.strip(), images=images,
               boxes=boxes, upsample=upsample, max_tokens=s["max_tokens"], gen=gen,
               caption=None if upsample else layout.compose_caption(request, boxes))
     if gen is not None:
@@ -208,6 +214,7 @@ def save_outputs(results: list[Image.Image], req: GenRequest, request: str, boxe
         "guidance": req.guidance if req.model == "base" else None,
         "negative_prompt": req.negative_prompt if req.model == "base" else None,
         "loras": [{"name": n, "weight": w} for n, w in req.loras], "mock": backend.is_mock,
+        "text_encoder": TEXT_ENCODER_ID or "original",
     }
     info = PngInfo()
     info.add_text("parameters", json.dumps(meta, ensure_ascii=False))
@@ -256,23 +263,39 @@ async def edit(client, gallery, instruction, upsample, size_mode, follow, aspect
         yield out
 
 
-async def layout_generate(client, prompt, boxes, upsample, aspect, tier, *settings, progress=gr.Progress()):
-    pipeline = layout.pipeline_boxes(boxes)
-    if not pipeline:
-        raise gr.Error("Нарисуйте хотя бы один бокс: два клика по холсту — два угла")
+def layout_boxes(editor) -> list[dict]:
+    """Боксы редактора раскладки в формате пайплайна; без боксов или с пустыми описаниями — понятная ошибка."""
+    state = box_editor.to_state(editor)
+    if not state:
+        raise gr.Error("Нарисуйте хотя бы один бокс: зажмите кнопку мыши на холсте и протяните")
+    if unnamed := [b["id"] for b in state if not b["desc"]]:
+        raise gr.Error(f"Опишите, что в боксах: {', '.join(unnamed)} — поле рядом с id в списке под холстом")
+    return layout.pipeline_boxes(state)
+
+
+async def layout_generate(client, prompt, editor, upsample, aspect, tier, *settings, progress=gr.Progress()):
+    pipeline = layout_boxes(editor)
     size = size_for_aspect(parse_ratio(aspect) or 1.0, TIERS.get(tier, 1024))
     async for out in run_job(client, prompt, [], pipeline, size, upsample, settings, progress):
         yield out
 
 
-async def box_edit_generate(client, gallery, instruction, boxes, upsample, follow, tier, *settings,
-                            progress=gr.Progress()):
-    images = gallery_images(gallery)
+def edit_boxes(editor, images: list[Image.Image]) -> list[dict]:
+    """Боксы редактора правки в формате пайплайна; без боксов или без описаний — понятная ошибка."""
     if not images:
         raise gr.Error("Загрузите изображение")
-    pipeline = layout.pipeline_boxes(boxes)
-    if not pipeline:
-        raise gr.Error("Отметьте хотя бы один бокс")
+    state = [b for b in box_editor.to_edit_state(editor) if b["ref"] < len(images)]
+    if not state:
+        raise gr.Error("Отметьте хотя бы один бокс: протяните мышью по картинке")
+    if unnamed := [b["id"] for b in state if not b["desc"] and b["kind"] in (layout.KIND_NEW, layout.KIND_MOVE)]:
+        raise gr.Error(f"Опишите, что в боксах: {', '.join(unnamed)} — поле рядом с id в списке под картинкой")
+    return layout.pipeline_boxes(state)
+
+
+async def box_edit_generate(client, gallery, instruction, editor, upsample, follow, tier, *settings,
+                            progress=gr.Progress()):
+    images = gallery_images(gallery)
+    pipeline = edit_boxes(editor, images)
     size = resolve_size(SIZE_REF, follow, "1:1", tier, 0, 0, images)
     async for out in run_job(client, instruction, images, pipeline, size, upsample, settings, progress):
         yield out
@@ -288,97 +311,15 @@ async def rewrite_edit(client, gallery, prompt, *settings, progress=gr.Progress(
         yield out
 
 
-async def rewrite_layout(client, prompt, boxes, *settings, progress=gr.Progress()):
-    async for out in rewrite_job(client, prompt, [], layout.pipeline_boxes(boxes), settings, progress):
+async def rewrite_layout(client, prompt, editor, *settings, progress=gr.Progress()):
+    async for out in rewrite_job(client, prompt, [], layout_boxes(editor), settings, progress):
         yield out
 
 
-async def rewrite_box_edit(client, gallery, prompt, boxes, *settings, progress=gr.Progress()):
-    async for out in rewrite_job(client, prompt, gallery_images(gallery), layout.pipeline_boxes(boxes), settings,
-                                 progress):
-        yield out
-
-
-# ---- Раскладка: холст и клики ----
-def layout_canvas(aspect: str) -> Image.Image:
-    return layout.blank_canvas(parse_ratio(aspect) or 1.0)
-
-
-def layout_click(evt: gr.SelectData, aspect, boxes, pending, desc, stem):
-    base = layout_canvas(aspect)
-    x, y = evt.index
-    if pending is None:
-        return (layout.render(base, boxes, pending=[x, y]), boxes, [x, y], gr.skip(),
-                "Первый угол есть — кликните второй")
-    box = layout.normalize(pending, (x, y), *base.size)
-    if box is None:
-        return layout.render(base, boxes), boxes, None, gr.skip(), "Слишком маленький бокс — попробуйте ещё раз"
-    new = layout.Box(id=layout.next_id(boxes, stem or "obj"), kind=layout.KIND_LAYOUT, tgt=box, desc=(desc or "").strip())
-    boxes = (boxes or []) + [vars(new)]
-    return layout.render(base, boxes), boxes, None, layout.to_table(boxes, edit=False), f"Добавлен `{new.id}`"
-
-
-def layout_rerender(aspect, boxes):
-    return layout.render(layout_canvas(aspect), boxes), None
-
-
-# ---- Точечная правка: холст и клики ----
-def shown_image(gallery, shown) -> tuple[Image.Image | None, int]:
+async def rewrite_box_edit(client, gallery, prompt, editor, *settings, progress=gr.Progress()):
     images = gallery_images(gallery)
-    if not images:
-        return None, 0
-    idx = max(0, min(len(images) - 1, int(shown or 1) - 1))
-    return layout.fit_preview(images[idx]), idx
-
-
-def box_edit_render(gallery, shown, boxes, pending=None, pending_box=None):
-    base, idx = shown_image(gallery, shown)
-    if base is None:
-        return None
-    return layout.render(base, boxes, shown_ref=idx, pending=pending, pending_box=pending_box)
-
-
-def box_edit_click(evt: gr.SelectData, gallery, shown, kind_label, boxes, pending, pending_box, desc, stem):
-    base, idx = shown_image(gallery, shown)
-    if base is None:
-        raise gr.Error("Сначала загрузите изображение")
-    kind = layout.KIND_BY_LABEL[kind_label]
-    x, y = evt.index
-    if pending is None:
-        hint = "Первый угол есть — кликните второй"
-        return (layout.render(base, boxes, idx, pending=[x, y], pending_box=pending_box), boxes, [x, y],
-                pending_box, gr.skip(), hint)
-    box = layout.normalize(pending, (x, y), *base.size)
-    if box is None:
-        return (layout.render(base, boxes, idx, pending_box=pending_box), boxes, None, pending_box, gr.skip(),
-                "Слишком маленький бокс — попробуйте ещё раз")
-    if kind == layout.KIND_MOVE and pending_box is None:
-        return (layout.render(base, boxes, idx, pending_box=box), boxes, None, box, gr.skip(),
-                "Где элемент сейчас — отмечено. Теперь обведите **новое место** (координаты — в кадре результата)")
-    src, tgt = {
-        layout.KIND_NEW: (None, box),
-        layout.KIND_MOVE: (pending_box, box),
-        layout.KIND_KEEP: (box, box),
-        layout.KIND_REMOVE: (box, None),
-    }[kind]
-    new = layout.Box(id=layout.next_id(boxes, stem or "obj"), kind=kind, ref=idx, src=src, tgt=tgt,
-                     desc=(desc or "").strip())
-    boxes = (boxes or []) + [vars(new)]
-    return (layout.render(base, boxes, idx), boxes, None, None, layout.to_table(boxes),
-            f"Добавлен `{new.id}` · {layout.KIND_LABEL[kind]}")
-
-
-def table_edit(table, boxes, edit: bool = True):
-    try:
-        return layout.from_table(table, boxes, edit)
-    except (ValueError, TypeError) as e:
-        gr.Warning(f"Таблица боксов: {e}")
-        return boxes
-
-
-def drop_last(boxes, edit: bool = True):
-    boxes = (boxes or [])[:-1]
-    return boxes, layout.to_table(boxes, edit), None, None
+    async for out in rewrite_job(client, prompt, images, edit_boxes(editor, images), settings, progress):
+        yield out
 
 
 # ---- Результаты → референсы, история ----
@@ -479,10 +420,11 @@ def header_html() -> str:
 HELP_MD = f"""
 ### Как устроен Klein
 
-**Апсемплер промптов обязателен.** Klein обучен на подробных описаниях сцены. Короткий запрос сначала
-переписывает отдельная модель BFL — [flux-3-image-klein-pup](https://huggingface.co/black-forest-labs/flux-3-image-klein-pup)
-(9B): стиль, сцена, свет, камера, каждый объект с цветами, материалами и местом в кадре. Галочка «✨ Апсемплер»
-стоит в каждой вкладке. Описание, которое ушло в модель, видно под результатом; кнопка «✨ Только переписать»
+**Апсемплер промптов.** Klein обучен на подробных описаниях сцены, и короткий запрос «как есть» даёт заметно
+более слабый результат. Отдельная модель BFL — [flux-3-image-klein-pup](https://huggingface.co/black-forest-labs/flux-3-image-klein-pup)
+(9B) — переписывает его в полное описание: стиль, сцена, свет, камера, каждый объект с цветами, материалами и местом
+в кадре. Галочка «✨ Апсемплер» есть в каждой вкладке; по умолчанию она снята (апсемплер добавляет ~15–18 с) —
+включайте её для коротких запросов или пишите подробный промпт сами (по-английски, 80–200 слов). Описание, которое ушло в модель, видно под результатом; кнопка «✨ Только переписать»
 кладёт его в поле промпта, чтобы поправить руками и перебирать seed без повторного переписывания.
 Одинаковые запросы апсемплер не переписывает дважды (кэш). Апсемплер понимает запросы на любом языке, пишет по-английски.
 
@@ -496,17 +438,28 @@ Base грузится при первом выборе.
 on the sofa in the first image, keep everything else unchanged`. Цвета можно задавать hex-кодами (`#e01075`),
 новый текст — в кавычках.
 
-**Раскладка боксами.** Два клика по холсту — два угла бокса. Описание бокса и id можно задать до кликов
-или поправить в таблице. Координаты — `[y0, x0, y1, x1]` в долях кадра (в таблицу можно вводить и 0–1000).
+**Раскладка боксами.** Протяните мышью по холсту — получится бокс (и внутри другого бокса тоже), курсор сразу
+встанет в поле его описания. Перенести бокс — за его подпись (✥ id · описание), размер — за маркеры выделенного.
+Клик выделяет меньший бокс под курсором, повторный клик — следующий под ним (так достаётся перекрытый);
+✕ на выделенном боксе, 🗑 в списке или Delete — удалить,
+Ctrl+Z — отменить, стрелки — сдвинуть (с Shift — на 5 %), Ctrl+D — копия, «сетка 5 %» — привязка. id берётся
+из описания (`a red balloon` → `balloon_1`), пока не зададите его сами. Точные координаты — в списке, `y0, x0, y1, x1`
+на холсте 0–1000.
 Апсемплер сохраняет боксы как есть и пишет описание вокруг них, ссылаясь на каждый как `<id>`. Без апсемплера
 пишите `<id>` в тексте сами — таблица допишется автоматически. Боксы задают место и масштаб, но не обрезают
 как маска; слишком маленькие (≈40×25 px) новые элементы могут не появиться. Каждой строке текста — свой бокс.
 
-**Точечная правка боксами.** Действия:
+**Точечная правка боксами.** Протяните мышью по картинке — получится бокс; холст и жесты те же, что в раскладке.
+Действие бокса — кнопки в его строке (меняются в любой момент), действие для следующих боксов — «Новый бокс» над
+картинкой:
 - **➕ Новый / заменить** — новый элемент (или новый вид элемента) в отмеченной области;
-- **↔ Переместить** — сначала обведите, где элемент сейчас, потом — новое место;
+- **↔ Переместить** — обведённая область — где элемент сейчас (пунктир); рядом появится рамка «→ сюда» —
+  перетащите её на новое место и подгоните размер, между ними стрелка;
 - **📌 Оставить как есть** — «якорь» для того, что не должно двигаться;
 - **✖ Удалить** — модель закрасит область тем, что было за элементом.
+
+Если референсов несколько, переключайте их миниатюрами над холстом; боксы рисуются на том, что показан.
+Рамки «куда» и новые элементы — в кадре результата (обычно он того же формата, что редактируемая картинка).
 
 Скажите о правке и в инструкции тоже («move the knight up and to the left, keep the rest unchanged»).
 Пиксели вне отмеченных областей обычно остаются нетронутыми.
@@ -534,15 +487,15 @@ def settings_sidebar():
         gr.Markdown("### ⚙️ Параметры")
         model = gr.Radio([(MODEL_LABELS[m], m) for m in REPOS], value="distilled", label="Модель")
         steps = gr.Slider(1, MAX_STEPS["distilled"], value=DEFAULT_STEPS["distilled"], step=1, label="Шаги",
-                          info="Distilled: 16 (обучен на 4–16). Base: 50")
+                          info="Distilled: 16; 8 — вдвое быстрее, на фото почти без разницы, но надписи хуже; 4 — черновик. Base: 50")
         with gr.Accordion("Base: CFG и negative prompt", open=True, visible=False) as base_box:
             guidance = gr.Slider(1.0, 10.0, value=DEFAULT_GUIDANCE, step=0.1, label="Guidance (CFG)",
-                                 info="Рекомендовано: 3.5")
+                                 info="3.5 — рекомендовано; 1 — выкл.: вдвое быстрее, но хуже надписи")
             negative = gr.Textbox(label="Negative prompt", lines=2,
                                   info="Лучше описывать желаемое позитивно, чем перечислять ненужное")
-        with gr.Row():
-            seed = gr.Number(value=42, precision=0, minimum=0, maximum=MAX_SEED, label="Seed", scale=3)
-            randomize = gr.Checkbox(value=True, label="🎲 случайный", scale=2)
+        with gr.Group():
+            seed = gr.Number(value=42, precision=0, minimum=0, maximum=MAX_SEED, label="Seed")
+            randomize = gr.Checkbox(value=True, label="🎲 Случайный seed каждый раз")
         num_images = gr.Slider(1, 4, value=1, step=1, label="Картинок за раз")
         with gr.Accordion("Апсемплер", open=False):
             max_tokens = gr.Slider(256, 4096, value=DEFAULT_MAX_NEW_TOKENS, step=64, label="max_new_tokens",
@@ -561,12 +514,16 @@ def settings_sidebar():
         gr.Markdown(f"<small>{backend.description}</small>")
 
     def on_model(m):
-        note = None if backend.is_loaded(m) else "Base загрузится при первой генерации (~11 GB, пара минут)"
-        if note:
-            gr.Info(note)
+        if m == "base":
+            # 50 шагов × 2 прохода трансформера (CFG) ≈ 100 × 0.76 с на 3090 при 1 MP.
+            gr.Info("Base — около 1.5 мин на картинку 1 MP (50 шагов, по два прохода с CFG). Для обычной работы "
+                    "Distilled: ~15 с при том же качестве. Base нужна ради negative prompt и проверки LoRA."
+                    + ("" if backend.is_loaded(m) else " Первая генерация — ещё ~20 с на загрузку модели."),
+                    duration=12)
         return (gr.Slider(maximum=MAX_STEPS[m], value=DEFAULT_STEPS[m]), gr.Accordion(visible=m == "base"))
 
-    model.change(on_model, model, [steps, base_box], queue=False)
+    # Через очередь: gr.Info доходит до браузера только у событий в очереди.
+    model.change(on_model, model, [steps, base_box], show_progress="hidden")
 
     def on_lora_add(src, weight, table):
         try:
@@ -644,8 +601,10 @@ def wire_size_summary(size_inputs, summary, gallery=None):
 
 def action_row(label: str):
     with gr.Row():
-        upsample = gr.Checkbox(value=upsampler.enabled, interactive=upsampler.enabled, label="✨ Апсемплер",
-                               info="Рекомендуется всегда" if upsampler.enabled else "выключен на сервере",
+        upsample = gr.Checkbox(value=upsampler.enabled and UPSAMPLE_DEFAULT, interactive=upsampler.enabled,
+                               label="✨ Апсемплер",
+                               info="Для коротких промптов — заметно лучше, +15–18 с" if upsampler.enabled
+                               else "выключен на сервере",
                                scale=2)
         rewrite = gr.Button("✨ Только переписать", interactive=upsampler.enabled, scale=2)
         go = gr.Button(label, variant="primary", elem_classes="generate-btn", scale=3)
@@ -715,25 +674,14 @@ def build_ui() -> gr.Blocks:
 
         # ---------------- Раскладка боксами ----------------
         with gr.Tab("▣ Раскладка"):
-            gr.Markdown("Разместите элементы будущей картинки: **два клика по холсту — два угла бокса**. "
-                        "Описание и id бокса задайте до кликов или поправьте в таблице.", elem_classes="hint")
-            l_boxes, l_pending = gr.State([]), gr.State(None)
+            gr.Markdown("**Протяните по холсту — появится бокс** (можно и внутри другого), сразу впишите, что в нём. "
+                        "Перенести — за подпись бокса ✥, размер — за маркеры выделенного. Клик "
+                        "выделяет бокс, повторный клик — бокс под ним. ✕ или Delete — удалить, Ctrl+Z — отменить.",
+                        elem_classes="hint")
             with gr.Row():
+                with gr.Column(scale=7):
+                    l_editor = box_editor.LayoutEditor("1:1")
                 with gr.Column(scale=5):
-                    l_canvas = gr.Image(value=layout_canvas("1:1"), type="pil", interactive=False, show_label=False,
-                                        elem_classes="canvas", buttons=[], height=520)
-                    with gr.Row():
-                        l_desc = gr.Textbox(label="Что в следующем боксе", placeholder="a red hot-air balloon",
-                                            scale=4)
-                        l_stem = gr.Textbox(label="id", placeholder="balloon", scale=1, max_lines=1)
-                    l_status = gr.Markdown("Кликните первый угол бокса")
-                    l_table = gr.Dataframe(headers=layout.LAYOUT_HEADERS, column_count=(3, "fixed"), value=[],
-                                           interactive=True, wrap=True, show_row_numbers=False, label="Боксы",
-                                           column_widths=["22%", "34%", "44%"])
-                    with gr.Row():
-                        l_undo = gr.Button("↶ Удалить последний", size="sm")
-                        l_clear = gr.Button("Очистить", size="sm", variant="secondary")
-                with gr.Column(scale=6):
                     l_prompt = gr.Textbox(label="Общее описание сцены", lines=4, placeholder=(
                         "hot-air balloons over a green valley at sunrise\n"
                         "без апсемплера ссылайтесь на боксы так: <balloon_1>"))
@@ -742,19 +690,11 @@ def build_ui() -> gr.Blocks:
                         l_tier = gr.Dropdown(list(TIERS), value=DEFAULT_TIER, label="Площадь")
                     l_upsample, l_rewrite, l_go, l_cancel = action_row("▣ Сгенерировать")
                     l_out = result_column()
-            l_canvas.select(layout_click, [l_aspect, l_boxes, l_pending, l_desc, l_stem],
-                            [l_canvas, l_boxes, l_pending, l_table, l_status], queue=False, trigger_mode="once")
-            l_aspect.change(layout_rerender, [l_aspect, l_boxes], [l_canvas, l_pending], queue=False)
-            l_table.input(lambda t, b: table_edit(t, b, False), [l_table, l_boxes], l_boxes, queue=False).then(
-                layout_rerender, [l_aspect, l_boxes], [l_canvas, l_pending], queue=False)
-            l_undo.click(lambda b: drop_last(b, False), l_boxes, [l_boxes, l_table, l_pending, l_pending],
-                         queue=False).then(
-                layout_rerender, [l_aspect, l_boxes], [l_canvas, l_pending], queue=False)
-            l_clear.click(lambda: ([], [], None), None, [l_boxes, l_table, l_pending], queue=False).then(
-                layout_rerender, [l_aspect, l_boxes], [l_canvas, l_pending], queue=False)
+            l_aspect.change(box_editor.with_aspect, [l_editor, l_aspect], l_editor, queue=False,
+                            show_progress="hidden")
             l_events = [
-                l_rewrite.click(rewrite_layout, [client, l_prompt, l_boxes, *settings], [l_prompt, l_upsample], show_progress_on=l_prompt),
-                l_go.click(layout_generate, [client, l_prompt, l_boxes, l_upsample, l_aspect, l_tier, *settings],
+                l_rewrite.click(rewrite_layout, [client, l_prompt, l_editor, *settings], [l_prompt, l_upsample], show_progress_on=l_prompt),
+                l_go.click(layout_generate, [client, l_prompt, l_editor, l_upsample, l_aspect, l_tier, *settings],
                            [l_out["gallery"], l_out["results"], l_out["caption"], l_out["info"], seed_box,
                             l_out["files"]], show_progress_on=l_out["gallery"]),
             ]
@@ -764,29 +704,16 @@ def build_ui() -> gr.Blocks:
 
         # ---------------- Точечная правка боксами ----------------
         with gr.Tab("🎯 Правка боксами"):
-            gr.Markdown("Выберите действие и **обведите область двумя кликами**. «↔ Переместить» — сначала где "
-                        "элемент сейчас, потом новое место. Опишите правку и в инструкции.", elem_classes="hint")
-            b_boxes, b_pending, b_pending_box = gr.State([]), gr.State(None), gr.State(None)
+            gr.Markdown("Загрузите картинку и **протяните мышью по ней — появится бокс**. Действие бокса — кнопки в его "
+                        "строке: ➕ новый элемент, ↔ перенести (перетащите рамку «→ сюда»), 📌 не трогать, ✖ убрать. "
+                        "Перенос — за подпись бокса, размер — за маркеры. Опишите правку и в инструкции.",
+                        elem_classes="hint")
             with gr.Row():
-                with gr.Column(scale=5):
+                with gr.Column(scale=7):
                     b_images = gr.Gallery(label="Изображения (первое — редактируемое)", type="pil", format="png",
-                                          interactive=True, columns=5, height=150)
-                    with gr.Row():
-                        b_kind = gr.Radio(list(layout.EDIT_KINDS.values()), value=layout.EDIT_KINDS["new"],
-                                          label="Действие", scale=4)
-                        b_shown = gr.Number(value=1, precision=0, minimum=1, maximum=MAX_REFERENCE_IMAGES,
-                                            label="На холсте №", scale=1)
-                    b_canvas = gr.Image(type="pil", interactive=False, show_label=False, elem_classes="canvas",
-                                        buttons=[], height=480, placeholder="Загрузите изображение выше")
-                    with gr.Row():
-                        b_desc = gr.Textbox(label="Описание элемента (каким он будет)",
-                                            placeholder="a small potted cactus", scale=4)
-                        b_stem = gr.Textbox(label="id", placeholder="cactus", scale=1, max_lines=1)
-                    b_status = gr.Markdown("Кликните первый угол бокса")
-                    with gr.Row():
-                        b_undo = gr.Button("↶ Удалить последний", size="sm")
-                        b_clear = gr.Button("Очистить", size="sm", variant="secondary")
-                with gr.Column(scale=6):
+                                          interactive=True, columns=6, height=130)
+                    b_editor = box_editor.EditBoxEditor()
+                with gr.Column(scale=5):
                     b_prompt = gr.Textbox(label="Инструкция", lines=4, placeholder=(
                         "add a small potted cactus in the marked spot, keep the rest unchanged\n"
                         "move the knight up and to the left"))
@@ -796,28 +723,12 @@ def build_ui() -> gr.Blocks:
                         b_tier = gr.Dropdown(list(TIERS), value=DEFAULT_TIER, label="Площадь", scale=2)
                     b_upsample, b_rewrite, b_go, b_cancel = action_row("🎯 Применить")
                     b_out = result_column()
-            b_table = gr.Dataframe(headers=layout.EDIT_HEADERS, column_count=(6, "fixed"), value=[],
-                                   interactive=True, static_columns=[1, 2], wrap=True, show_row_numbers=False,
-                                   label="Боксы (координаты — доли кадра; можно править, как и описания)",
-                                   column_widths=["11%", "14%", "5%", "18%", "18%", "34%"])
-            render_inputs = [b_images, b_shown, b_boxes]
-            b_canvas.select(box_edit_click, [b_images, b_shown, b_kind, b_boxes, b_pending, b_pending_box, b_desc,
-                                             b_stem],
-                            [b_canvas, b_boxes, b_pending, b_pending_box, b_table, b_status], queue=False,
-                            trigger_mode="once")
-            for trigger in (b_images.change, b_shown.change, b_kind.change):
-                trigger(lambda g, n, b: (box_edit_render(g, n, b), None, None), render_inputs,
-                        [b_canvas, b_pending, b_pending_box], queue=False)
-            b_table.input(table_edit, [b_table, b_boxes], b_boxes, queue=False).then(
-                box_edit_render, render_inputs, b_canvas, queue=False)
-            b_undo.click(drop_last, b_boxes, [b_boxes, b_table, b_pending, b_pending_box], queue=False).then(
-                box_edit_render, render_inputs, b_canvas, queue=False)
-            b_clear.click(lambda: ([], [], None, None), None, [b_boxes, b_table, b_pending, b_pending_box],
-                          queue=False).then(box_edit_render, render_inputs, b_canvas, queue=False)
+            b_images.change(lambda g, v: box_editor.with_refs(v, gallery_images(g)), [b_images, b_editor], b_editor,
+                            show_progress="hidden")
             b_events = [
-                b_rewrite.click(rewrite_box_edit, [client, b_images, b_prompt, b_boxes, *settings],
+                b_rewrite.click(rewrite_box_edit, [client, b_images, b_prompt, b_editor, *settings],
                                 [b_prompt, b_upsample], show_progress_on=b_prompt),
-                b_go.click(box_edit_generate, [client, b_images, b_prompt, b_boxes, b_upsample, b_follow, b_tier,
+                b_go.click(box_edit_generate, [client, b_images, b_prompt, b_editor, b_upsample, b_follow, b_tier,
                                                *settings],
                            [b_out["gallery"], b_out["results"], b_out["caption"], b_out["info"], seed_box,
                             b_out["files"]], show_progress_on=b_out["gallery"]),

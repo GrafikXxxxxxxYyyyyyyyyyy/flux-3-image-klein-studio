@@ -20,9 +20,10 @@
 #   KLEIN_DOWNLOAD=0      не качать веса заранее (скачаются при первом запуске приложения)
 #   KLEIN_BASE=1          скачать и Base (~11 GB; без этого Base скачается при первом выборе в интерфейсе)
 #   KLEIN_UPSAMPLER=…     local (по умолчанию, +19 GB) / server / off — см. README
+#   KLEIN_TEXT_ENCODER_ID=…  текстовый энкодер (по умолчанию Heretic-версия Qwen3-VL-4B; пусто — оригинальный из Klein)
 #   KLEIN_PORT=17860      внутренний порт приложения (слушает только 127.0.0.1)
 #   KLEIN_VENV=<путь>     venv для установки; по умолчанию /venv/main (образы Vast), иначе ./.venv
-# Остальные настройки приложения (KLEIN_OFFLOAD, KLEIN_MEMORY_MARGIN, …, см. README) на Vast читаются из
+# Остальные настройки приложения (KLEIN_PIN_MEMORY, KLEIN_MEMORY_MARGIN_GB, …, см. README) на Vast читаются из
 # ${WORKSPACE}/.env — после правки: supervisorctl restart klein-studio.
 
 set -euo pipefail
@@ -36,6 +37,7 @@ UPSAMPLER="${KLEIN_UPSAMPLER:-local}"
 MODEL_ID="${KLEIN_MODEL_ID:-black-forest-labs/flux-3-image-klein}"
 BASE_ID="${KLEIN_BASE_MODEL_ID:-black-forest-labs/flux-3-image-klein-base}"
 PUP_ID="${KLEIN_UPSAMPLER_ID:-black-forest-labs/flux-3-image-klein-pup}"
+TEXT_ENCODER_ID="${KLEIN_TEXT_ENCODER_ID-DreamFast/Qwen3-VL-4b-Heretic}"   # без «:» — пустая строка значит оригинальный
 VAST=0
 [[ -d /opt/supervisor-scripts/utils && -d /etc/supervisor/conf.d ]] && command -v supervisorctl >/dev/null && VAST=1
 
@@ -52,7 +54,7 @@ else
     warn "GPU не найдена — приложение запустится в режиме заглушки (картинки ненастоящие)"
 fi
 ram_gb=$(awk '/MemTotal/ {printf "%d", $2 / 1048576}' /proc/meminfo 2>/dev/null || echo 0)
-[[ "$ram_gb" -gt 0 && "$ram_gb" -lt 46 ]] && warn "RAM ${ram_gb} GB: на картах < 48 GB модели выгружаются в RAM, нужно ≥ 48 GB"
+[[ "$ram_gb" -gt 0 && "$ram_gb" -lt 60 ]] && warn "RAM ${ram_gb} GB: веса моделей (~36 GB) живут в закреплённой RAM, нужно ≥ 64 GB (или KLEIN_PIN_MEMORY=0)"
 cache_dir="${HF_HOME:-$HOME/.cache/huggingface}"
 while [[ ! -d "$cache_dir" ]]; do cache_dir="$(dirname "$cache_dir")"; done   # кэша может ещё не быть
 free_gb=$(df -BG --output=avail "$cache_dir" | tail -1 | tr -dc '0-9')
@@ -79,11 +81,25 @@ else
     "$PY" -m pip install -q --upgrade pip
     "$PY" -m pip install -r "$APP_DIR/requirements.txt"
 fi
+# Ядро свёртки для апсемплера (Qwen3.5): готовых колёс под свежий torch нет, собирается из исходников (~5 мин, нужен
+# nvcc). Без него апсемплер работает, но медленнее — поэтому ошибка сборки не останавливает установку.
+if ! "$PY" -c "import causal_conv1d" 2>/dev/null; then
+    if command -v nvcc >/dev/null; then
+        echo "Сборка causal-conv1d (несколько минут)…"
+        arch=$("$PY" -c "import torch; c = torch.cuda.get_device_capability(); print(f'{c[0]}.{c[1]}')" 2>/dev/null || true)
+        if command -v uv >/dev/null; then inst=(uv pip install --python "$PY"); else inst=("$PY" -m pip install); fi
+        MAX_JOBS="$(nproc)" TORCH_CUDA_ARCH_LIST="${arch:-8.6}" CAUSAL_CONV1D_FORCE_BUILD=TRUE \
+            "${inst[@]}" --no-build-isolation causal-conv1d >/dev/null 2>&1 \
+            || warn "causal-conv1d не собрался — апсемплер будет медленнее"
+    else
+        warn "Нет nvcc — causal-conv1d не собрать, апсемплер будет медленнее"
+    fi
+fi
 "$PY" - <<'EOF'
 import torch, diffusers, transformers, gradio
 print(f"torch {torch.__version__} (CUDA {torch.version.cuda}, доступна: {torch.cuda.is_available()}), "
       f"diffusers {diffusers.__version__}, transformers {transformers.__version__}, gradio {gradio.__version__}")
-from diffusers import ComponentsManager, ModularPipeline  # noqa: F401
+from diffusers import ModularPipeline  # noqa: F401
 from diffusers.modular_pipelines.flux3 import prompt_upsampler  # noqa: F401 — упадёт, если diffusers без FLUX 3
 EOF
 
@@ -106,9 +122,17 @@ if [[ "$DOWNLOAD" == 1 ]]; then
     SKIP=(--exclude "model.safetensors" --exclude "ae.safetensors" --exclude "variants/*" --exclude "*.jpg"
           --exclude "assets/*")
     step "Klein Distilled: трансформер, энкодер Qwen3-VL-4B, VAE (~20 GB)"
-    "$HF" download "$MODEL_ID" "${SKIP[@]}" --quiet >/dev/null \
+    # Со своим энкодером веса оригинального из репозитория Klein не нужны (токенизатор и конфиг берём оттуда).
+    ENC_SKIP=()
+    [[ -n "$TEXT_ENCODER_ID" ]] && ENC_SKIP=(--exclude "text_encoder/*.safetensors")
+    "$HF" download "$MODEL_ID" "${SKIP[@]}" "${ENC_SKIP[@]}" --quiet >/dev/null \
         || die "Не удалось скачать $MODEL_ID — лицензия принята? https://huggingface.co/$MODEL_ID"
     echo "$MODEL_ID — готово"
+    if [[ -n "$TEXT_ENCODER_ID" ]]; then
+        "$HF" download "$TEXT_ENCODER_ID" --exclude "*.gguf" --exclude "graphs/*" --quiet >/dev/null \
+            || die "Не удалось скачать энкодер $TEXT_ENCODER_ID"
+        echo "$TEXT_ENCODER_ID — готово"
+    fi
     if [[ "$BASE" == 1 ]]; then
         step "Klein Base: трансформер (~11 GB; энкодер и VAE общие с Distilled)"
         "$HF" download "$BASE_ID" "${SKIP[@]}" --exclude "text_encoder/*.safetensors" --exclude "vae/*" --quiet >/dev/null \

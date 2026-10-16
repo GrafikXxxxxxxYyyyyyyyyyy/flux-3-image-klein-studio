@@ -7,6 +7,7 @@ diffusers @ git+https://github.com/huggingface/diffusers@d42ebf9c6e0b46103b74283
 accelerate
 peft>=0.17  # LoRA
 huggingface_hub
+flash-linear-attention  # быстрые ядра линейного внимания апсемплера (Qwen3.5); causal-conv1d собирает setup.sh
 gradio>=6.28,<7
 pillow>=10.1
 

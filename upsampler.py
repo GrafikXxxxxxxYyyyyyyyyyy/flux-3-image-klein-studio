@@ -20,6 +20,7 @@ import io
 import json
 import os
 import threading
+import time
 from collections import OrderedDict
 
 from PIL import Image
@@ -57,6 +58,11 @@ class PromptUpsampler:
             "server": f"Апсемплер: {SERVER_URL}",
             "off": "Апсемплер выключен (KLEIN_UPSAMPLER=off) — промпт уходит в модель как есть",
         }.get(self.mode, self.mode)
+
+    def cached(self, request: str, images: list[Image.Image] | None = None, boxes: list[dict] | None = None,
+               max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS) -> str | None:
+        """Готовое описание, если такой запрос уже переписывали (без очереди к видеокарте)."""
+        return self._cache.get(_cache_key(request, images or [], boxes, max_new_tokens))
 
     # ------------------------------------------------------------------ #
     def __call__(self, request: str, images: list[Image.Image] | None = None, boxes: list[dict] | None = None,
@@ -145,6 +151,7 @@ class PromptUpsampler:
 
     @staticmethod
     def _mock(request, images, boxes) -> str:
+        time.sleep(float(os.environ.get("KLEIN_MOCK_UPSAMPLE_SECONDS", 0)))
         refs = f" Reference images: {len(images)}." if images else ""
         text = (f"[апсемплер-заглушка] A detailed full-scene caption written from the request: «{request.strip()}».{refs}"
                 " Medium and style, scene, lighting and camera, every subject with its colors, materials and"

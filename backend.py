@@ -54,6 +54,12 @@ TIERS = {"768² (0.6 MP)": 768, "1K (1 MP)": 1024, "1.5K (2.4 MP)": 1536, "2K (4
 DEFAULT_TIER = "1K (1 MP)"
 
 ProgressFn = Callable[[float, str], None]
+StopFn = Callable[[], bool]
+MOCK_STEP_SECONDS = float(os.environ.get("KLEIN_MOCK_STEP_SECONDS", 0.03))
+
+
+class JobCancelled(Exception):
+    """Задачу отменили посреди генерации (поднимается из хука шага трансформера)."""
 
 
 def snap(v: float) -> int:
@@ -148,6 +154,7 @@ class KleinBackend:
         self.fp8_storage = os.environ.get("KLEIN_FP8_STORAGE") == "1"
 
         self.pipes: dict = {}
+        self._on_step = None  # колбэк текущей генерации, его зовёт хук трансформера
         self.loras: dict[str, tuple[str, str | None]] = {}  # имя → (источник, weight_name)
         self._loaded_loras: dict[str, set[str]] = {}  # модель → загруженные в неё адаптеры
         self._load_model(os.environ.get("KLEIN_DEFAULT_MODEL", "distilled"))
@@ -213,81 +220,101 @@ class KleinBackend:
     # ------------------------------------------------------------------ #
     def add_lora(self, source: str, name: str | None = None) -> str:
         """Регистрирует LoRA: путь к файлу, `owner/repo`, `owner/repo/файл.safetensors` или URL Hugging Face.
-        Веса грузятся в модель при первой генерации с этим адаптером."""
-        repo_or_path, weight_name = resolve_lora_source(source)
-        name = name or re.sub(r"[^A-Za-z0-9_]", "_", Path(weight_name or repo_or_path).stem)[:40] or "lora"
-        base, n = name, 2
-        while name in self.loras:
-            name, n = f"{base}_{n}", n + 1
-        with self._lock:
-            # Сразу грузим в текущую модель, чтобы ошибка (не тот формат, нет файла) была видна при добавлении.
-            model = next(iter(self.pipes))
-            self.pipes[model].load_lora_weights(repo_or_path, weight_name=weight_name, adapter_name=name)
-            self._loaded_loras[model].add(name)
-            self.loras[name] = (repo_or_path, weight_name)
-        return name
 
-    def remove_loras(self) -> None:
+        Адаптеры общие для всех пользователей, но включаются только в генерациях того, кто их выбрал
+        (`GenRequest.loras`). Скачивание идёт вне замка видеокарты, чтобы не останавливать чужие генерации."""
+        folder, weight_name = fetch_lora(source)
+        name = lora_name(name, weight_name, self.loras)
         with self._lock:
-            for model, names in self._loaded_loras.items():
-                if names:
-                    self.pipes[model].delete_adapters(list(names))
-                names.clear()
-            self.loras.clear()
+            # Сразу грузим в текущую модель, чтобы ошибка (не тот формат) была видна при добавлении.
+            model = next(iter(self.pipes))
+            self.pipes[model].load_lora_weights(folder, weight_name=weight_name, adapter_name=name)
+            self._loaded_loras[model].add(name)
+            self.loras[name] = (folder, weight_name)
+        return name
 
     def _apply_loras(self, model: str, loras: list[tuple[str, float]]) -> None:
         pipe = self.pipes[model]
         loras = [(n, w) for n, w in loras if n in self.loras]
         for name, _ in loras:
             if name not in self._loaded_loras[model]:
-                repo_or_path, weight_name = self.loras[name]
-                pipe.load_lora_weights(repo_or_path, weight_name=weight_name, adapter_name=name)
+                folder, weight_name = self.loras[name]
+                pipe.load_lora_weights(folder, weight_name=weight_name, adapter_name=name)
                 self._loaded_loras[model].add(name)
         if loras:
+            pipe.enable_lora()
             pipe.set_adapters([n for n, _ in loras], adapter_weights=[w for _, w in loras])
         elif self._loaded_loras[model]:
             pipe.disable_lora()
 
     # ------------------------------------------------------------------ #
-    def generate(self, req: GenRequest, progress: ProgressFn | None = None) -> list[Image.Image]:
+    def _step_hook(self, pipe) -> None:
+        """Хук на каждый вызов трансформера: прогресс по шагам и остановка отменённой задачи."""
+        if getattr(pipe.transformer, "_klein_step_hook", False):
+            return
+
+        def hook(module, args, kwargs):
+            if self._on_step is not None:
+                self._on_step()
+
+        pipe.transformer.register_forward_pre_hook(hook, with_kwargs=True)
+        pipe.transformer._klein_step_hook = True
+
+    def generate(self, req: GenRequest, progress: ProgressFn | None = None,
+                 should_stop: StopFn | None = None) -> list[Image.Image]:
         torch = self._torch
         with self._lock:
             if progress and req.model not in self.pipes:
                 progress(0, f"Загрузка {MODEL_LABELS[req.model]} (первый раз — пара минут)")
             pipe = self._load_model(req.model)
+            self._step_hook(pipe)
             self._apply_loras(req.model, req.loras)
             kwargs = dict(prompt=req.prompt, num_inference_steps=req.steps, num_images_per_prompt=req.num_images)
             if req.images:
                 kwargs["image"] = req.images if len(req.images) > 1 else req.images[0]
             if req.width and req.height:
                 kwargs.update(width=req.width, height=req.height)
+            # Base с CFG зовёт трансформер дважды на шаг (условный и безусловный проход).
+            calls_per_step = 1
             if req.model == "base":
                 if getattr(pipe.guider, "guidance_scale", None) != req.guidance:
                     pipe.guider = pipe.guider.new(guidance_scale=req.guidance)
                 if req.negative_prompt.strip():
                     kwargs["negative_prompt"] = req.negative_prompt.strip()
+                calls_per_step = 2 if req.guidance > 1 else 1
+            calls = [0]
+
+            def on_step():
+                if should_stop and should_stop():
+                    raise JobCancelled
+                calls[0] += 1
+                if progress:
+                    step = min(req.steps, (calls[0] - 1) // calls_per_step + 1)
+                    progress(min(0.99, calls[0] / (req.steps * calls_per_step)), f"Шаг {step}/{req.steps}")
 
             width, height = req.resolved_size()
             tile_upfront = self.vram_gb < 40 and width * height * req.num_images > TILE_UPFRONT_PIXELS
-            with torch.inference_mode():
-                images = None
-                if not tile_upfront:
-                    try:
-                        images = self._run(pipe, kwargs, req.seed)
-                    except torch.OutOfMemoryError as e:
-                        self._release(e)
-                        if progress:
-                            progress(0, "Не хватило видеопамяти — повтор с декодированием VAE тайлами")
-                if images is None:
+            self._on_step = on_step
+            try:
+                with torch.inference_mode():
+                    if not tile_upfront:
+                        try:
+                            return self._run(pipe, kwargs, req.seed)
+                        except torch.OutOfMemoryError as e:
+                            self._release(e)
+                            calls[0] = 0
+                            if progress:
+                                progress(0, "Не хватило видеопамяти — повтор с декодированием VAE тайлами")
                     pipe.vae.enable_tiling()
                     try:
-                        images = self._run(pipe, kwargs, req.seed)
-                    except BaseException as e:
-                        self._release(e)
-                        raise
+                        return self._run(pipe, kwargs, req.seed)
                     finally:
                         pipe.vae.disable_tiling()
-        return images
+            except BaseException as e:
+                self._release(e)
+                raise
+            finally:
+                self._on_step = None
 
     def _run(self, pipe, kwargs: dict, seed: int) -> list[Image.Image]:
         # Генератор каждый раз свежий: повтор после OOM должен дать ту же картинку.
@@ -321,6 +348,36 @@ def resolve_lora_source(source: str) -> tuple[str, str | None]:
     return source, None
 
 
+def fetch_lora(source: str) -> tuple[str, str]:
+    """Скачивает LoRA (если она не локальная) → (папка, имя файла) для `load_lora_weights`."""
+    repo_or_path, weight_name = resolve_lora_source(source)
+    if Path(repo_or_path).is_dir():
+        if weight_name is None:
+            files = sorted(p.name for p in Path(repo_or_path).glob("*.safetensors"))
+            if len(files) != 1:
+                raise ValueError(f"В папке {len(files)} файлов .safetensors — укажите путь к нужному файлу")
+            weight_name = files[0]
+        return repo_or_path, weight_name
+    from huggingface_hub import hf_hub_download, list_repo_files
+
+    if weight_name is None:
+        files = [f for f in list_repo_files(repo_or_path) if f.endswith(".safetensors")]
+        if len(files) != 1:
+            raise ValueError(f"В {repo_or_path} файлов .safetensors: {len(files)} — укажите owner/repo/файл "
+                             f"({', '.join(files[:5])})")
+        weight_name = files[0]
+    path = Path(hf_hub_download(repo_or_path, weight_name))
+    return str(path.parent), path.name
+
+
+def lora_name(name: str | None, source: str, taken) -> str:
+    name = name or re.sub(r"[^A-Za-z0-9_]", "_", Path(source).stem)[:40] or "lora"
+    base, n = name, 2
+    while name in taken:
+        name, n = f"{base}_{n}", n + 1
+    return name
+
+
 class MockBackend:
     """Имитирует генерацию: картинка нужного размера с текстом запроса и миниатюрами референсов."""
 
@@ -344,23 +401,23 @@ class MockBackend:
 
     def add_lora(self, source: str, name: str | None = None) -> str:
         repo_or_path, weight_name = resolve_lora_source(source)
-        name = name or re.sub(r"[^A-Za-z0-9_]", "_", Path(weight_name or repo_or_path).stem)[:40] or "lora"
+        name = lora_name(name, weight_name or repo_or_path, self.loras)
         self.loras[name] = (repo_or_path, weight_name)
         return name
 
-    def remove_loras(self) -> None:
-        self.loras.clear()
+    def generate(self, req: GenRequest, progress: ProgressFn | None = None,
+                 should_stop: StopFn | None = None) -> list[Image.Image]:
+        for step in range(req.steps):
+            if should_stop and should_stop():
+                raise JobCancelled
+            time.sleep(MOCK_STEP_SECONDS)
+            if progress:
+                progress((step + 1) / req.steps, f"Шаг {step + 1}/{req.steps} (заглушка)")
+        self._loaded.add(req.model)
 
-    def generate(self, req: GenRequest, progress: ProgressFn | None = None) -> list[Image.Image]:
         width, height = req.resolved_size()
         scale = min(1.0, self.PREVIEW_MAX_SIDE / max(width, height))
         pw, ph = max(64, int(width * scale)), max(64, int(height * scale))
-        for step in range(req.steps):
-            time.sleep(0.03)
-            if progress:
-                progress((step + 1) / req.steps, "Денойзинг (заглушка)")
-        self._loaded.add(req.model)
-
         results = []
         for n in range(req.num_images):
             hue = (req.seed * 37 + n * 61) % 255

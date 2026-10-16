@@ -11,10 +11,12 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 import random
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -43,12 +45,16 @@ from backend import (
     size_for_aspect,
     size_like_image,
 )
+from scheduler import PHASE_STREAK, QUEUE_MAX, USER_MAX_JOBS, GpuScheduler, Job, QueueFull
 from upsampler import DEFAULT_MAX_NEW_TOKENS, PromptUpsampler
 
 OUTPUT_DIR = Path(os.environ.get("KLEIN_OUTPUT_DIR", "outputs"))
 MAX_SEED = 2**32 - 1
 SLIDER_MAX_SIDE = 4096
 HISTORY_LIMIT = 120
+# own — каждый видит только свои генерации (по id браузера), all — общая лента всех пользователей.
+HISTORY_MODE = os.environ.get("KLEIN_HISTORY", "own")
+POLL_SECONDS = 0.5
 
 SIZE_REF = "Как у изображения №"
 SIZE_RATIO = "Пропорции и площадь"
@@ -56,6 +62,7 @@ SIZE_CUSTOM = "Свой размер"
 
 backend = load_backend()
 upsampler = PromptUpsampler(backend)
+scheduler = GpuScheduler(backend, upsampler)
 
 
 # --------------------------------------------------------------------------- #
@@ -104,66 +111,96 @@ def settings_values(settings: list) -> dict:
                 max_tokens=int(max_tokens), loras=loras)
 
 
-def run(request: str, images: list[Image.Image], boxes: list[dict] | None, size: tuple[int, int] | None,
-        upsample: bool, settings: list, progress: gr.Progress):
-    s = settings_values(settings)
+async def wait_job(job, progress: gr.Progress):
+    """Ждёт задачу из очереди, отдавая строку статуса при каждом изменении. Отмена (кнопка или закрытая вкладка)
+    прерывает генератор на await — тогда задача снимается из очереди или останавливается на следующем шаге."""
+    last = None
+    try:
+        while not job.done.is_set():
+            text = scheduler.describe(job)
+            progress(job.progress if job.state == "running" and job.progress else None, desc=text)
+            if text != last:
+                yield text
+                last = text
+            await asyncio.sleep(POLL_SECONDS)
+    finally:
+        if not job.done.is_set():
+            scheduler.cancel(job)
+
+
+def check_job(job) -> None:
+    if job.state == "cancelled":
+        raise gr.Error("Задача отменена")
+    if job.error is not None:
+        e = job.error
+        prefix = "Апсемплер: " if job.caption is None else ""
+        raise gr.Error(f"{prefix}{type(e).__name__}: {e}")
+
+
+def make_job(client, request: str, images: list[Image.Image], boxes, upsample: bool, s: dict,
+             gen: GenRequest | None) -> Job:
     if not request or not request.strip():
         raise gr.Error("Пустой промпт")
     if len(images) > MAX_REFERENCE_IMAGES:
         raise gr.Error(f"Модель принимает не больше {MAX_REFERENCE_IMAGES} изображений, загружено {len(images)}")
-    images = [flatten_alpha(im) for im in images]
-    started = time.time()
-
-    cached = False
     upsample = bool(upsample) and upsampler.enabled
-    if upsample:
-        progress(0, desc="✨ Апсемплер пишет описание сцены…")
-        try:
-            caption, cached = upsampler(request.strip(), images, boxes, s["max_tokens"])
-        except Exception as e:
-            raise gr.Error(f"Апсемплер: {type(e).__name__}: {e}") from e
-    else:
-        caption = layout.compose_caption(request, boxes)
-    upsample_time = time.time() - started
-
-    req = GenRequest(prompt=caption, images=images, width=size[0] if size else None,
-                     height=size[1] if size else None, model=s["model"], steps=s["steps"], seed=s["seed"],
-                     num_images=s["num_images"], guidance=s["guidance"], negative_prompt=s["negative"],
-                     loras=s["loras"])
-    width, height = req.resolved_size()
-    progress(0, desc=f"Генерация {width}×{height}")
+    job = Job(owner=client or "anon", request=request.strip(), images=[flatten_alpha(im) for im in images],
+              boxes=boxes, upsample=upsample, max_tokens=s["max_tokens"], gen=gen,
+              caption=None if upsample else layout.compose_caption(request, boxes))
+    if gen is not None:
+        gen.images = job.images
     try:
-        results = backend.generate(req, progress=lambda f, d: progress(f, desc=d))
-    except Exception as e:  # OOM и прочее — показать в интерфейсе, а не уронить очередь
-        raise gr.Error(f"{type(e).__name__}: {e}") from e
-    elapsed = time.time() - started
+        return scheduler.submit(job)
+    except QueueFull as e:
+        raise gr.Error(str(e)) from e
 
-    saved = save_outputs(results, req, request, boxes, upsample)
+
+async def run_job(client, request: str, images: list[Image.Image], boxes: list[dict] | None,
+                  size: tuple[int, int] | None, upsample: bool, settings, progress: gr.Progress):
+    """Ставит генерацию в общую очередь видеокарты и ждёт её. Выходы: галерея, результаты, описание,
+    инфо (пока ждём — статус очереди), seed, файлы."""
+    s = settings_values(list(settings))
+    gen = GenRequest(prompt="", width=size[0] if size else None, height=size[1] if size else None,
+                     model=s["model"], steps=s["steps"], seed=s["seed"], num_images=s["num_images"],
+                     guidance=s["guidance"], negative_prompt=s["negative"], loras=s["loras"])
+    job = make_job(client, request, images, boxes, upsample, s, gen)
+    async for text in wait_job(job, progress):
+        yield gr.skip(), gr.skip(), gr.skip(), f"⏳ {text}", gr.skip(), gr.skip()
+    check_job(job)
+
+    caption, results = job.caption, job.results
+    saved = await asyncio.to_thread(save_outputs, results, gen, request, boxes, job.upsample, job.owner)
+    width, height = gen.resolved_size()
+    elapsed = time.time() - job.created
+    queued = (job.started or job.created) - job.created
     notes = []
-    if upsample:
-        notes.append("описание из кэша" if cached else f"апсемплер {upsample_time:.1f} с")
+    if queued >= 1:
+        notes.append(f"ожидание в очереди {queued:.0f} с")
+    if job.upsample:
+        notes.append("описание из кэша" if job.cached else f"апсемплер {job.upsample_time:.1f} с")
     elif len(request.split()) < 40 and not layout.has_box_table(caption):
         notes.append("⚠️ короткий промпт без апсемплера — результат будет слабее")
-    if boxes and not upsample and (missing := layout.missing_mentions(caption, [
+    if boxes and not job.upsample and (missing := layout.missing_mentions(caption, [
             {"id": b["id"]} for b in boxes])):
         notes.append(f"⚠️ в тексте нет ссылок на боксы: {', '.join(f'<{m}>' for m in missing)}")
     info = (
-        f"**{width}×{height}** · seed `{req.seed}` · {req.steps} шагов · {MODEL_LABELS[req.model].split(' (')[0]}"
-        + (f" · CFG {req.guidance}" if req.model == "base" else "")
+        f"**{width}×{height}** · seed `{gen.seed}` · {gen.steps} шагов · {MODEL_LABELS[gen.model].split(' (')[0]}"
+        + (f" · CFG {gen.guidance}" if gen.model == "base" else "")
         + f" · {elapsed:.1f} с"
         + (f" · референсов: {len(images)}" if images else "")
         + (f" · боксов: {len(boxes)}" if boxes else "")
-        + (f" · LoRA: {', '.join(f'{n} ×{w:g}' for n, w in req.loras)}" if req.loras else "")
+        + (f" · LoRA: {', '.join(f'{n} ×{w:g}' for n, w in gen.loras)}" if gen.loras else "")
         + (f"  \n{' · '.join(notes)}" if notes else "")
         + ("  \n⚠️ Заглушка: картинки ненастоящие" if backend.is_mock else "")
     )
     # Галерея показывает сжатый WebP (PNG 2K — 6–8 MB, через туннель это долго); оригиналы — файлами.
-    return results, results, caption, info, req.seed, [str(p) for p in saved] or None
+    yield results, results, caption, info, gen.seed, [str(p) for p in saved] or None
 
 
-def save_outputs(results: list[Image.Image], req: GenRequest, request: str, boxes, upsample: bool) -> list[Path]:
+def save_outputs(results: list[Image.Image], req: GenRequest, request: str, boxes, upsample: bool,
+                 owner: str) -> list[Path]:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    stem = f"{datetime.now():%Y%m%d-%H%M%S}_{req.seed}"
+    stem = f"{datetime.now():%Y%m%d-%H%M%S}_{req.seed}_{uuid.uuid4().hex[:6]}"
     meta = {
         "request": request, "prompt": req.prompt, "upsampled": upsample, "boxes": boxes,
         "model": req.model, "repo": REPOS[req.model], "size": list(req.resolved_size()), "steps": req.steps,
@@ -181,54 +218,55 @@ def save_outputs(results: list[Image.Image], req: GenRequest, request: str, boxe
         paths.append(OUTPUT_DIR / f"{stem}_{i}.png")
         im.save(paths[-1], pnginfo=info)
     meta["files"] = [p.name for p in paths]
+    meta["owner"] = owner  # только в JSON рядом: по нему история показывает каждому его картинки
     (OUTPUT_DIR / f"{stem}.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2))
     return paths
 
 
-def rewrite_only(request: str, images: list[Image.Image], boxes, settings: list):
+async def rewrite_job(client, request: str, images: list[Image.Image], boxes, settings, progress: gr.Progress):
     """Только апсемплер: описание попадает в поле промпта, апсемплер при генерации выключается."""
     if not upsampler.enabled:
         raise gr.Error("Апсемплер выключен (KLEIN_UPSAMPLER=off)")
-    if not request or not request.strip():
-        raise gr.Error("Пустой промпт")
-    s = settings_values(settings)
-    started = time.time()
-    try:
-        caption, cached = upsampler(request.strip(), [flatten_alpha(im) for im in images], boxes, s["max_tokens"])
-    except Exception as e:
-        raise gr.Error(f"Апсемплер: {type(e).__name__}: {e}") from e
-    gr.Info("Описание из кэша" if cached else f"Описание готово за {time.time() - started:.1f} с — "
+    job = make_job(client, request, images, boxes, True, settings_values(list(settings)), None)
+    async for _ in wait_job(job, progress):
+        yield gr.skip(), gr.skip()
+    check_job(job)
+    gr.Info("Описание из кэша" if job.cached else f"Описание готово за {job.upsample_time:.1f} с — "
             "правьте и генерируйте без апсемплера")
-    return caption, False
+    yield job.caption, False
 
 
 # --------------------------------------------------------------------------- #
-# Обработчики вкладок
+# Обработчики вкладок (async-генераторы: ждут задачу в общей очереди)
 # --------------------------------------------------------------------------- #
-def t2i(prompt, upsample, size_mode, aspect, tier, width, height, *settings, progress=gr.Progress(track_tqdm=True)):
+async def t2i(client, prompt, upsample, size_mode, aspect, tier, width, height, *settings,
+              progress=gr.Progress()):
     size = resolve_size(size_mode, 1, aspect, tier, width, height, [])
-    return run(prompt, [], None, size, upsample, list(settings), progress)
+    async for out in run_job(client, prompt, [], None, size, upsample, settings, progress):
+        yield out
 
 
-def edit(gallery, instruction, upsample, size_mode, follow, aspect, tier, width, height, *settings,
-         progress=gr.Progress(track_tqdm=True)):
+async def edit(client, gallery, instruction, upsample, size_mode, follow, aspect, tier, width, height, *settings,
+               progress=gr.Progress()):
     images = gallery_images(gallery)
     if not images:
         raise gr.Error("Загрузите хотя бы одно изображение")
     size = resolve_size(size_mode, follow, aspect, tier, width, height, images)
-    return run(instruction, images, None, size, upsample, list(settings), progress)
+    async for out in run_job(client, instruction, images, None, size, upsample, settings, progress):
+        yield out
 
 
-def layout_generate(prompt, boxes, upsample, aspect, tier, *settings, progress=gr.Progress(track_tqdm=True)):
+async def layout_generate(client, prompt, boxes, upsample, aspect, tier, *settings, progress=gr.Progress()):
     pipeline = layout.pipeline_boxes(boxes)
     if not pipeline:
         raise gr.Error("Нарисуйте хотя бы один бокс: два клика по холсту — два угла")
     size = size_for_aspect(parse_ratio(aspect) or 1.0, TIERS.get(tier, 1024))
-    return run(prompt, [], pipeline, size, upsample, list(settings), progress)
+    async for out in run_job(client, prompt, [], pipeline, size, upsample, settings, progress):
+        yield out
 
 
-def box_edit_generate(gallery, instruction, boxes, upsample, follow, tier, *settings,
-                      progress=gr.Progress(track_tqdm=True)):
+async def box_edit_generate(client, gallery, instruction, boxes, upsample, follow, tier, *settings,
+                            progress=gr.Progress()):
     images = gallery_images(gallery)
     if not images:
         raise gr.Error("Загрузите изображение")
@@ -236,7 +274,29 @@ def box_edit_generate(gallery, instruction, boxes, upsample, follow, tier, *sett
     if not pipeline:
         raise gr.Error("Отметьте хотя бы один бокс")
     size = resolve_size(SIZE_REF, follow, "1:1", tier, 0, 0, images)
-    return run(instruction, images, pipeline, size, upsample, list(settings), progress)
+    async for out in run_job(client, instruction, images, pipeline, size, upsample, settings, progress):
+        yield out
+
+
+async def rewrite_text(client, prompt, *settings, progress=gr.Progress()):
+    async for out in rewrite_job(client, prompt, [], None, settings, progress):
+        yield out
+
+
+async def rewrite_edit(client, gallery, prompt, *settings, progress=gr.Progress()):
+    async for out in rewrite_job(client, prompt, gallery_images(gallery), None, settings, progress):
+        yield out
+
+
+async def rewrite_layout(client, prompt, boxes, *settings, progress=gr.Progress()):
+    async for out in rewrite_job(client, prompt, [], layout.pipeline_boxes(boxes), settings, progress):
+        yield out
+
+
+async def rewrite_box_edit(client, gallery, prompt, boxes, *settings, progress=gr.Progress()):
+    async for out in rewrite_job(client, prompt, gallery_images(gallery), layout.pipeline_boxes(boxes), settings,
+                                 progress):
+        yield out
 
 
 # ---- Раскладка: холст и клики ----
@@ -333,7 +393,8 @@ def results_to_refs(results, selected, edit_gallery, box_gallery):
     return edit_images + [image], box_images + [image]
 
 
-def history_items():
+def history_items(client) -> tuple[list, list]:
+    """Генерации из OUTPUT_DIR, новые первыми. В режиме own — только сделанные из этого браузера."""
     if not OUTPUT_DIR.is_dir():
         return [], []
     items, metas = [], []
@@ -342,18 +403,20 @@ def history_items():
             meta = json.loads(meta_path.read_text())
         except (OSError, json.JSONDecodeError):
             continue
+        if HISTORY_MODE != "all" and meta.get("owner") != client:
+            continue
         for name in meta.get("files", []):
             path = OUTPUT_DIR / name
             if path.exists():
                 items.append((str(path), f"{meta.get('model', '')} · seed {meta.get('seed')}"))
-                metas.append(meta)
+                metas.append({k: v for k, v in meta.items() if k != "owner"} | {"file": name})
         if len(items) >= HISTORY_LIMIT:
             break
     return items, metas
 
 
-def history_refresh():
-    items, metas = history_items()
+def history_refresh(client):
+    items, metas = history_items(client)
     return items, metas, None, None
 
 
@@ -365,8 +428,7 @@ def history_select(evt: gr.SelectData, metas):
 def history_to_refs(selected, metas, edit_gallery, box_gallery):
     if selected is None or not metas:
         raise gr.Error("Выберите картинку в истории")
-    items, _ = history_items()
-    image = Image.open(items[selected][0])
+    image = Image.open(OUTPUT_DIR / metas[selected]["file"])
     return results_to_refs([image], 0, edit_gallery, box_gallery)
 
 
@@ -394,6 +456,7 @@ CSS = """
 .generate-btn { min-height: 50px !important; font-size: 16px !important; font-weight: 650 !important; }
 .canvas img { cursor: crosshair !important; }
 .hint { opacity: .78; font-size: 13px; }
+.queue-status { padding: 2px 6px; opacity: .85; font-size: 14px; }
 .mock-banner { background: rgba(255, 193, 7, .14); border: 1px solid rgba(255, 193, 7, .55);
                padding: 8px 14px; border-radius: 10px; }
 .result-gallery { border-radius: 14px; }
@@ -452,6 +515,12 @@ on the sofa in the first image, keep everything else unchanged`. Цвета мо
 без конвертации — BFL советует вес 0.75 (0.5–1.0). Источник: путь к файлу, `owner/repo`,
 `owner/repo/файл.safetensors` или ссылка `https://huggingface.co/…/resolve/main/файл.safetensors`.
 
+**Очередь.** Видеокарта одна, поэтому все задачи всех пользователей идут через общую очередь: под кнопкой видно
+место в очереди и примерное время до старта, в шапке — состояние видеокарты. У одного пользователя не больше
+{USER_MAX_JOBS} задач одновременно, всего в очереди — до {QUEUE_MAX}. «✖» отменяет задачу — и ожидающую, и уже идущую
+(остановится на следующем шаге). Пока апсемплер в видеопамяти, он переписывает промпты всех ожидающих подряд
+(до {PHASE_STREAK} задач), потом подряд идут генерации — на 24 GB это экономит перекладывание 19 GB на каждый запрос.
+
 **Размеры.** Кратно {SIZE_MULTIPLE} px, от {MIN_SIDE} px до 4K (16.8 MP). Тиры площади и пропорции — как в BFL API.
 Большие размеры на картах < 40 GB декодируются VAE тайлами.
 
@@ -488,7 +557,7 @@ def settings_sidebar():
             lora_table = gr.Dataframe(headers=["LoRA", "вес", "вкл"], datatype=["str", "number", "bool"],
                                       column_count=(3, "fixed"), value=[], interactive=True, static_columns=[0],
                                       show_row_numbers=False, label="Подключённые")
-            lora_clear = gr.Button("Убрать все LoRA", size="sm", variant="secondary")
+            lora_clear = gr.Button("Отключить все", size="sm", variant="secondary")
         gr.Markdown(f"<small>{backend.description}</small>")
 
     def on_model(m):
@@ -508,13 +577,14 @@ def settings_sidebar():
         gr.Info(f"LoRA «{name}» подключена")
         return rows + [[name, float(weight), True]], ""
 
-    def on_lora_clear():
-        backend.remove_loras()
-        return []
-
     lora_add.click(on_lora_add, [lora_src, lora_weight, lora_table], [lora_table, lora_src])
-    lora_clear.click(on_lora_clear, None, lora_table)
+    # Адаптеры загружены для всех; «отключить» убирает их только из генераций этого пользователя.
+    lora_clear.click(lambda: [], None, lora_table, queue=False)
     return [model, steps, guidance, negative, seed, randomize, num_images, max_tokens, lora_table], seed, randomize
+
+
+def init_client(client):
+    return client or uuid.uuid4().hex
 
 
 def select_index(evt: gr.SelectData) -> int:
@@ -579,12 +649,17 @@ def action_row(label: str):
                                scale=2)
         rewrite = gr.Button("✨ Только переписать", interactive=upsampler.enabled, scale=2)
         go = gr.Button(label, variant="primary", elem_classes="generate-btn", scale=3)
-    return upsample, rewrite, go
+        cancel = gr.Button("✖", variant="stop", elem_classes="generate-btn", scale=0, min_width=52)
+    return upsample, rewrite, go, cancel
 
 
 def build_ui() -> gr.Blocks:
     with gr.Blocks(title="FLUX 3 Image Klein Studio") as demo:
         gr.HTML(header_html())
+        queue_status = gr.Markdown(scheduler.snapshot(), elem_classes="queue-status")
+        gr.Timer(2.0).tick(scheduler.snapshot, None, queue_status, queue=False, show_progress="hidden")
+        # Постоянный id браузера (localStorage): лимит задач на пользователя и личная история.
+        client = gr.BrowserState(None, storage_key="klein_client_id")
         if backend.is_mock:
             gr.Markdown("⚠️ **Режим заглушки** — модель не загружена, результаты — плейсхолдеры для проверки "
                         "интерфейса.", elem_classes="mock-banner")
@@ -599,15 +674,19 @@ def build_ui() -> gr.Blocks:
                         "A red fox asleep in a vintage suitcase on a train, soft window light\n"
                         "или по-русски: лиса спит в старом чемодане в купе поезда"))
                     t_size, t_summary = size_block([SIZE_RATIO, SIZE_CUSTOM], SIZE_RATIO)
-                    t_upsample, t_rewrite, t_go = action_row("🎨 Сгенерировать")
+                    t_upsample, t_rewrite, t_go, t_cancel = action_row("🎨 Сгенерировать")
                 with gr.Column(scale=6):
                     t_out = result_column()
             size_fn, size_inputs = wire_size_summary(t_size, t_summary)
             demo.load(size_fn, size_inputs, t_summary, queue=False)
-            t_rewrite.click(lambda p, *s: rewrite_only(p, [], None, list(s)), [t_prompt, *settings],
-                            [t_prompt, t_upsample])
-            t_go.click(t2i, [t_prompt, t_upsample, t_size[0], *t_size[2:], *settings],
-                       [t_out["gallery"], t_out["results"], t_out["caption"], t_out["info"], seed_box, t_out["files"]])
+            t_events = [
+                t_rewrite.click(rewrite_text, [client, t_prompt, *settings], [t_prompt, t_upsample], show_progress_on=t_prompt),
+                t_go.click(t2i, [client, t_prompt, t_upsample, t_size[0], *t_size[2:], *settings],
+                           [t_out["gallery"], t_out["results"], t_out["caption"], t_out["info"], seed_box,
+                            t_out["files"]], show_progress_on=t_out["gallery"]),
+            ]
+            t_cancel.click(lambda: "✖ Задача отменена", None, t_out["info"], cancels=t_events,
+                            queue=False)
             outs.append((t_out, t_prompt, t_upsample))
 
         # ---------------- Редактирование / референсы ----------------
@@ -620,14 +699,18 @@ def build_ui() -> gr.Blocks:
                         "make it a winter night: snow on the roof, warm light in the windows\n"
                         "или: put the dog from the second image on the sofa in the first image"))
                     e_size, e_summary = size_block([SIZE_REF, SIZE_RATIO, SIZE_CUSTOM], SIZE_REF)
-                    e_upsample, e_rewrite, e_go = action_row("🖌️ Применить")
+                    e_upsample, e_rewrite, e_go, e_cancel = action_row("🖌️ Применить")
                 with gr.Column(scale=6):
                     e_out = result_column()
             wire_size_summary(e_size, e_summary, e_images)
-            e_rewrite.click(lambda g, p, *s: rewrite_only(p, gallery_images(g), None, list(s)),
-                            [e_images, e_prompt, *settings], [e_prompt, e_upsample])
-            e_go.click(edit, [e_images, e_prompt, e_upsample, *e_size, *settings],
-                       [e_out["gallery"], e_out["results"], e_out["caption"], e_out["info"], seed_box, e_out["files"]])
+            e_events = [
+                e_rewrite.click(rewrite_edit, [client, e_images, e_prompt, *settings], [e_prompt, e_upsample], show_progress_on=e_prompt),
+                e_go.click(edit, [client, e_images, e_prompt, e_upsample, *e_size, *settings],
+                           [e_out["gallery"], e_out["results"], e_out["caption"], e_out["info"], seed_box,
+                            e_out["files"]], show_progress_on=e_out["gallery"]),
+            ]
+            e_cancel.click(lambda: "✖ Задача отменена", None, e_out["info"], cancels=e_events,
+                            queue=False)
             outs.append((e_out, e_prompt, e_upsample))
 
         # ---------------- Раскладка боксами ----------------
@@ -657,7 +740,7 @@ def build_ui() -> gr.Blocks:
                     with gr.Row():
                         l_aspect = gr.Dropdown(ASPECT_RATIOS, value="1:1", label="Пропорции")
                         l_tier = gr.Dropdown(list(TIERS), value=DEFAULT_TIER, label="Площадь")
-                    l_upsample, l_rewrite, l_go = action_row("▣ Сгенерировать")
+                    l_upsample, l_rewrite, l_go, l_cancel = action_row("▣ Сгенерировать")
                     l_out = result_column()
             l_canvas.select(layout_click, [l_aspect, l_boxes, l_pending, l_desc, l_stem],
                             [l_canvas, l_boxes, l_pending, l_table, l_status], queue=False, trigger_mode="once")
@@ -669,10 +752,14 @@ def build_ui() -> gr.Blocks:
                 layout_rerender, [l_aspect, l_boxes], [l_canvas, l_pending], queue=False)
             l_clear.click(lambda: ([], [], None), None, [l_boxes, l_table, l_pending], queue=False).then(
                 layout_rerender, [l_aspect, l_boxes], [l_canvas, l_pending], queue=False)
-            l_rewrite.click(lambda p, b, *s: rewrite_only(p, [], layout.pipeline_boxes(b), list(s)),
-                            [l_prompt, l_boxes, *settings], [l_prompt, l_upsample])
-            l_go.click(layout_generate, [l_prompt, l_boxes, l_upsample, l_aspect, l_tier, *settings],
-                       [l_out["gallery"], l_out["results"], l_out["caption"], l_out["info"], seed_box, l_out["files"]])
+            l_events = [
+                l_rewrite.click(rewrite_layout, [client, l_prompt, l_boxes, *settings], [l_prompt, l_upsample], show_progress_on=l_prompt),
+                l_go.click(layout_generate, [client, l_prompt, l_boxes, l_upsample, l_aspect, l_tier, *settings],
+                           [l_out["gallery"], l_out["results"], l_out["caption"], l_out["info"], seed_box,
+                            l_out["files"]], show_progress_on=l_out["gallery"]),
+            ]
+            l_cancel.click(lambda: "✖ Задача отменена", None, l_out["info"], cancels=l_events,
+                            queue=False)
             outs.append((l_out, l_prompt, l_upsample))
 
         # ---------------- Точечная правка боксами ----------------
@@ -707,7 +794,7 @@ def build_ui() -> gr.Blocks:
                         b_follow = gr.Number(value=1, precision=0, minimum=1, maximum=MAX_REFERENCE_IMAGES,
                                              label="Пропорции как у №", scale=1)
                         b_tier = gr.Dropdown(list(TIERS), value=DEFAULT_TIER, label="Площадь", scale=2)
-                    b_upsample, b_rewrite, b_go = action_row("🎯 Применить")
+                    b_upsample, b_rewrite, b_go, b_cancel = action_row("🎯 Применить")
                     b_out = result_column()
             b_table = gr.Dataframe(headers=layout.EDIT_HEADERS, column_count=(6, "fixed"), value=[],
                                    interactive=True, static_columns=[1, 2], wrap=True, show_row_numbers=False,
@@ -727,10 +814,16 @@ def build_ui() -> gr.Blocks:
                 box_edit_render, render_inputs, b_canvas, queue=False)
             b_clear.click(lambda: ([], [], None, None), None, [b_boxes, b_table, b_pending, b_pending_box],
                           queue=False).then(box_edit_render, render_inputs, b_canvas, queue=False)
-            b_rewrite.click(lambda g, p, b, *s: rewrite_only(p, gallery_images(g), layout.pipeline_boxes(b), list(s)),
-                            [b_images, b_prompt, b_boxes, *settings], [b_prompt, b_upsample])
-            b_go.click(box_edit_generate, [b_images, b_prompt, b_boxes, b_upsample, b_follow, b_tier, *settings],
-                       [b_out["gallery"], b_out["results"], b_out["caption"], b_out["info"], seed_box, b_out["files"]])
+            b_events = [
+                b_rewrite.click(rewrite_box_edit, [client, b_images, b_prompt, b_boxes, *settings],
+                                [b_prompt, b_upsample], show_progress_on=b_prompt),
+                b_go.click(box_edit_generate, [client, b_images, b_prompt, b_boxes, b_upsample, b_follow, b_tier,
+                                               *settings],
+                           [b_out["gallery"], b_out["results"], b_out["caption"], b_out["info"], seed_box,
+                            b_out["files"]], show_progress_on=b_out["gallery"]),
+            ]
+            b_cancel.click(lambda: "✖ Задача отменена", None, b_out["info"], cancels=b_events,
+                            queue=False)
             outs.append((b_out, b_prompt, b_upsample))
 
         # ---------------- История ----------------
@@ -738,18 +831,20 @@ def build_ui() -> gr.Blocks:
             h_metas, h_selected = gr.State([]), gr.State(None)
             with gr.Row():
                 with gr.Column(scale=7):
-                    h_gallery = gr.Gallery(label=f"Последние генерации (до {HISTORY_LIMIT}), папка {OUTPUT_DIR}/",
+                    h_gallery = gr.Gallery(label=f"{'Все' if HISTORY_MODE == 'all' else 'Ваши'} последние генерации "
+                                                 f"(до {HISTORY_LIMIT})",
                                            columns=5, height=620, interactive=False, allow_preview=True)
                 with gr.Column(scale=4):
                     h_refresh = gr.Button("↻ Обновить")
                     h_meta = gr.JSON(label="Параметры")
                     h_to_refs = gr.Button("↪ В референсы")
                     h_to_t2i = gr.Button("↪ Описание и seed в «Генерация»")
-            h_refresh.click(history_refresh, None, [h_gallery, h_metas, h_selected, h_meta], queue=False)
+            h_refresh.click(history_refresh, client, [h_gallery, h_metas, h_selected, h_meta], queue=False)
             h_gallery.select(history_select, h_metas, [h_selected, h_meta], queue=False)
             h_to_refs.click(history_to_refs, [h_selected, h_metas, e_images, b_images], [e_images, b_images])
             h_to_t2i.click(history_to_t2i, [h_selected, h_metas], [t_prompt, t_upsample, seed_box, randomize_box])
-            demo.load(history_refresh, None, [h_gallery, h_metas, h_selected, h_meta], queue=False)
+            demo.load(init_client, client, client, queue=False).then(
+                history_refresh, client, [h_gallery, h_metas, h_selected, h_meta], queue=False)
 
         with gr.Tab("❔ Справка"):
             gr.Markdown(HELP_MD)
@@ -781,8 +876,9 @@ def main() -> None:
         print("[app] ВНИМАНИЕ: публичная ссылка без --auth — GPU доступен любому, у кого есть ссылка")
 
     demo = build_ui()
-    # Одна видеокарта — одна генерация за раз, остальные ждут в очереди.
-    demo.queue(default_concurrency_limit=1)
+    # Очередь к видеокарте держит GpuScheduler: обработчики Gradio только ждут свою задачу, поэтому их
+    # одновременно может быть сколько угодно (async — без занятых потоков).
+    demo.queue(default_concurrency_limit=None)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     demo.launch(server_name=args.host, server_port=args.port, share=args.share, auth=auth, theme=THEME, css=CSS,
                 allowed_paths=[str(OUTPUT_DIR.resolve())])

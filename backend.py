@@ -1,0 +1,410 @@
+"""Бэкенды генерации для FLUX 3 Image Klein.
+
+- `KleinBackend` — настоящая модель через модульный пайплайн Diffusers (`ModularPipeline`, нужна CUDA).
+  Две модели на общих текстовом энкодере и VAE: Distilled (16 шагов, без CFG) и Base (50 шагов, CFG 3.5,
+  negative prompt). Апсемплер промптов — отдельная модель, см. `upsampler.py`.
+- `MockBackend` — заглушка без модели: рисует плейсхолдер с параметрами запроса, чтобы отлаживать интерфейс
+  на машине без видеокарты.
+
+Выбор делает `load_backend()`: `KLEIN_MOCK=1` включает заглушку, иначе берётся настоящая модель, если есть CUDA.
+"""
+
+from __future__ import annotations
+
+import gc
+import math
+import os
+import re
+import threading
+import time
+import traceback
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable
+
+from PIL import Image, ImageDraw, ImageFont
+
+# Пик памяти — декодирование VAE на больших размерах; expandable_segments снижает фрагментацию.
+# Действует, только если выставлено до первой аллокации CUDA.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+REPOS = {
+    "distilled": os.environ.get("KLEIN_MODEL_ID", "black-forest-labs/flux-3-image-klein"),
+    "base": os.environ.get("KLEIN_BASE_MODEL_ID", "black-forest-labs/flux-3-image-klein-base"),
+}
+MODEL_LABELS = {
+    "distilled": "Klein · Distilled (16 шагов, быстро)",
+    "base": "Klein · Base (50 шагов, CFG, negative)",
+}
+# Рекомендации BFL: Distilled — 16 шагов (обучен на 4–16) без CFG; Base — 50 шагов, CFG 3.5.
+DEFAULT_STEPS = {"distilled": 16, "base": 50}
+MAX_STEPS = {"distilled": 16, "base": 100}
+DEFAULT_GUIDANCE = 3.5
+
+MAX_REFERENCE_IMAGES = 10
+SIZE_MULTIPLE = 16  # один токен латента = 16×16 пикселей
+MIN_SIDE = 256
+MAX_SIDE = 6256
+MAX_PIXELS = 16_822_272  # 4K-тир BFL API (16.8 MP)
+
+# Соотношения сторон и тиры площади — как у BFL API.
+ASPECT_RATIOS = ["1:1", "4:5", "5:4", "3:4", "4:3", "2:3", "3:2", "5:7", "7:5", "9:16", "16:9", "1:2", "2:1",
+                 "9:21", "21:9"]
+TIERS = {"768² (0.6 MP)": 768, "1K (1 MP)": 1024, "1.5K (2.4 MP)": 1536, "2K (4.2 MP)": 2048, "4K (16.8 MP)": 4096}
+DEFAULT_TIER = "1K (1 MP)"
+
+ProgressFn = Callable[[float, str], None]
+
+
+def snap(v: float) -> int:
+    return int(min(MAX_SIDE, max(MIN_SIDE, round(v / SIZE_MULTIPLE) * SIZE_MULTIPLE)))
+
+
+def clamp_size(width: float, height: float) -> tuple[int, int]:
+    w, h = snap(width), snap(height)
+    if w * h > MAX_PIXELS:
+        k = math.sqrt(MAX_PIXELS / (w * h))
+        w, h = int(w * k) // SIZE_MULTIPLE * SIZE_MULTIPLE, int(h * k) // SIZE_MULTIPLE * SIZE_MULTIPLE
+    return w, h
+
+
+def parse_ratio(text: str) -> float | None:
+    m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*[:x×/]\s*(\d+(?:\.\d+)?)\s*", text or "")
+    if not m or float(m.group(2)) == 0:
+        return None
+    return float(m.group(1)) / float(m.group(2))
+
+
+def size_for_aspect(aspect: float, side: int) -> tuple[int, int]:
+    """Размер с отношением сторон `aspect` и площадью side²."""
+    width = math.sqrt(side * side * aspect)
+    return clamp_size(width, width / aspect)
+
+
+def size_like_image(image: Image.Image, side: int) -> tuple[int, int]:
+    return size_for_aspect(image.width / image.height, side)
+
+
+@dataclass
+class GenRequest:
+    prompt: str  # текст, который уходит в текстовый энкодер (после апсемплера или как есть)
+    images: list[Image.Image] = field(default_factory=list)
+    # None — размер выбирает пайплайн: 1024² для текста, 1 MP с пропорциями первого референса для правки.
+    width: int | None = None
+    height: int | None = None
+    model: str = "distilled"
+    steps: int = 16
+    seed: int = 0
+    num_images: int = 1
+    guidance: float = DEFAULT_GUIDANCE  # только Base
+    negative_prompt: str = ""  # только Base
+    loras: list[tuple[str, float]] = field(default_factory=list)  # (имя адаптера, вес)
+
+    def resolved_size(self) -> tuple[int, int]:
+        """Итоговый размер вывода — повторяет логику пайплайна (`Flux3ImageCondInputStep`)."""
+        if self.width and self.height:
+            return self.width, self.height
+        if self.images:
+            return size_like_image(self.images[0], 1024)
+        return 1024, 1024
+
+
+def flatten_alpha(image: Image.Image) -> Image.Image:
+    """Прозрачность — на белый фон, как делает апсемплер BFL (иначе прозрачное становится чёрным)."""
+    if image.mode in ("RGBA", "LA", "PA") or (image.mode == "P" and "transparency" in image.info):
+        rgba = image.convert("RGBA")
+        white = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
+        return Image.alpha_composite(white, rgba).convert("RGB")
+    return image.convert("RGB")
+
+
+# Выше этого (ширина × высота × число картинок) на картах < 40 GB VAE сразу декодирует тайлами:
+# иначе OOM случится после всего денойзинга, и генерацию придётся повторять.
+TILE_UPFRONT_PIXELS = 2048 * 2048
+SHARED_COMPONENTS = ("text_encoder", "vae")
+
+
+class KleinBackend:
+    is_mock = False
+
+    def __init__(self) -> None:
+        import torch
+        from diffusers import ComponentsManager
+
+        self._torch = torch
+        self._lock = threading.RLock()
+        self.vram_gb = torch.cuda.get_device_properties(0).total_memory / 2**30
+        offload = os.environ.get("KLEIN_OFFLOAD", "auto")
+        if offload == "auto":
+            # Веса bf16: трансформер 11 GB, энкодер Qwen3-VL-4B 8 GB, апсемплер 19 GB, VAE 0.3 GB.
+            # От 48 GB всё помещается сразу; меньше — менеджер держит в видеопамяти то, что влезает,
+            # а остальное выгружает в RAM (на 24 GB апсемплер на время работы вытесняет трансформер и энкодер).
+            offload = "none" if self.vram_gb >= 46 else "auto"
+        self.offload = offload
+        self.manager = ComponentsManager() if offload == "auto" else None
+        # Сколько видеопамяти менеджер оставляет свободной под активации, решая, что выгрузить. На 24 GB с 6 GB
+        # энкодер на время денойзинга уходит в RAM (+1–3 с), зато 2K–4K не падают в OOM; с 4 GB он остаётся.
+        self.memory_margin = os.environ.get("KLEIN_MEMORY_MARGIN") or ("6GB" if self.vram_gb < 32 else "4GB")
+        self.fp8_storage = os.environ.get("KLEIN_FP8_STORAGE") == "1"
+
+        self.pipes: dict = {}
+        self.loras: dict[str, tuple[str, str | None]] = {}  # имя → (источник, weight_name)
+        self._loaded_loras: dict[str, set[str]] = {}  # модель → загруженные в неё адаптеры
+        self._load_model(os.environ.get("KLEIN_DEFAULT_MODEL", "distilled"))
+        if os.environ.get("KLEIN_PRELOAD_BASE") == "1":
+            self._load_model("base")
+
+        gpu = torch.cuda.get_device_name(0)
+        self.description = (f"{gpu} ({self.vram_gb:.0f} GB) · offload: "
+                            f"{f'авто, запас {self.memory_margin}' if self.manager else 'нет'}"
+                            + (" · трансформер в FP8 (хранение)" if self.fp8_storage else ""))
+
+    # ------------------------------------------------------------------ #
+    @property
+    def models(self) -> list[str]:
+        return list(REPOS)
+
+    def is_loaded(self, model: str) -> bool:
+        return model in self.pipes
+
+    def _load_model(self, model: str):
+        """Пайплайн без шага апсемплера: промпт в него приходит уже готовым (см. upsampler.py)."""
+        if model in self.pipes:
+            return self.pipes[model]
+        torch = self._torch
+        from diffusers import ModularPipeline
+
+        repo = REPOS[model]
+        print(f"[backend] загрузка {repo}…")
+        started = time.time()
+        blocks = ModularPipeline.from_pretrained(repo).blocks
+        blocks.sub_blocks.pop("prompt_upsampler", None)
+        pipe = blocks.init_pipeline(repo, components_manager=self.manager)
+        donor = next(iter(self.pipes.values()), None)
+        if donor is None:
+            pipe.load_components(dtype={"vae": torch.float32, "default": torch.bfloat16})
+        else:
+            # Энкодер и VAE у Base и Distilled одинаковые — второй раз их не грузим.
+            names = [n for n, spec in pipe._component_specs.items()
+                     if spec.default_creation_method == "from_pretrained" and n not in SHARED_COMPONENTS]
+            pipe.load_components(names=names, dtype=torch.bfloat16)
+            pipe.update_components(**{n: getattr(donor, n) for n in SHARED_COMPONENTS})
+        if self.fp8_storage:
+            # Веса трансформера хранятся в FP8 (5.6 GB вместо 11), считаются в bf16 — работает и на Ampere.
+            pipe.transformer.enable_layerwise_casting(storage_dtype=torch.float8_e4m3fn,
+                                                      compute_dtype=torch.bfloat16)
+        if self.manager is not None:
+            # Менеджер запоминает компоненты при включении — после новой модели включаем заново.
+            self.manager.disable_auto_cpu_offload()
+            self.manager.enable_auto_cpu_offload(device="cuda", memory_reserve_margin=self.memory_margin)
+        else:
+            pipe.to("cuda")
+        self.pipes[model] = pipe
+        self._loaded_loras[model] = set()
+        print(f"[backend] {repo} готов за {time.time() - started:.0f} с")
+        return pipe
+
+    def ensure_model(self, model: str) -> None:
+        with self._lock:
+            self._load_model(model)
+
+    # ------------------------------------------------------------------ #
+    # LoRA
+    # ------------------------------------------------------------------ #
+    def add_lora(self, source: str, name: str | None = None) -> str:
+        """Регистрирует LoRA: путь к файлу, `owner/repo`, `owner/repo/файл.safetensors` или URL Hugging Face.
+        Веса грузятся в модель при первой генерации с этим адаптером."""
+        repo_or_path, weight_name = resolve_lora_source(source)
+        name = name or re.sub(r"[^A-Za-z0-9_]", "_", Path(weight_name or repo_or_path).stem)[:40] or "lora"
+        base, n = name, 2
+        while name in self.loras:
+            name, n = f"{base}_{n}", n + 1
+        with self._lock:
+            # Сразу грузим в текущую модель, чтобы ошибка (не тот формат, нет файла) была видна при добавлении.
+            model = next(iter(self.pipes))
+            self.pipes[model].load_lora_weights(repo_or_path, weight_name=weight_name, adapter_name=name)
+            self._loaded_loras[model].add(name)
+            self.loras[name] = (repo_or_path, weight_name)
+        return name
+
+    def remove_loras(self) -> None:
+        with self._lock:
+            for model, names in self._loaded_loras.items():
+                if names:
+                    self.pipes[model].delete_adapters(list(names))
+                names.clear()
+            self.loras.clear()
+
+    def _apply_loras(self, model: str, loras: list[tuple[str, float]]) -> None:
+        pipe = self.pipes[model]
+        loras = [(n, w) for n, w in loras if n in self.loras]
+        for name, _ in loras:
+            if name not in self._loaded_loras[model]:
+                repo_or_path, weight_name = self.loras[name]
+                pipe.load_lora_weights(repo_or_path, weight_name=weight_name, adapter_name=name)
+                self._loaded_loras[model].add(name)
+        if loras:
+            pipe.set_adapters([n for n, _ in loras], adapter_weights=[w for _, w in loras])
+        elif self._loaded_loras[model]:
+            pipe.disable_lora()
+
+    # ------------------------------------------------------------------ #
+    def generate(self, req: GenRequest, progress: ProgressFn | None = None) -> list[Image.Image]:
+        torch = self._torch
+        with self._lock:
+            if progress and req.model not in self.pipes:
+                progress(0, f"Загрузка {MODEL_LABELS[req.model]} (первый раз — пара минут)")
+            pipe = self._load_model(req.model)
+            self._apply_loras(req.model, req.loras)
+            kwargs = dict(prompt=req.prompt, num_inference_steps=req.steps, num_images_per_prompt=req.num_images)
+            if req.images:
+                kwargs["image"] = req.images if len(req.images) > 1 else req.images[0]
+            if req.width and req.height:
+                kwargs.update(width=req.width, height=req.height)
+            if req.model == "base":
+                if getattr(pipe.guider, "guidance_scale", None) != req.guidance:
+                    pipe.guider = pipe.guider.new(guidance_scale=req.guidance)
+                if req.negative_prompt.strip():
+                    kwargs["negative_prompt"] = req.negative_prompt.strip()
+
+            width, height = req.resolved_size()
+            tile_upfront = self.vram_gb < 40 and width * height * req.num_images > TILE_UPFRONT_PIXELS
+            with torch.inference_mode():
+                images = None
+                if not tile_upfront:
+                    try:
+                        images = self._run(pipe, kwargs, req.seed)
+                    except torch.OutOfMemoryError as e:
+                        self._release(e)
+                        if progress:
+                            progress(0, "Не хватило видеопамяти — повтор с декодированием VAE тайлами")
+                if images is None:
+                    pipe.vae.enable_tiling()
+                    try:
+                        images = self._run(pipe, kwargs, req.seed)
+                    except BaseException as e:
+                        self._release(e)
+                        raise
+                    finally:
+                        pipe.vae.disable_tiling()
+        return images
+
+    def _run(self, pipe, kwargs: dict, seed: int) -> list[Image.Image]:
+        # Генератор каждый раз свежий: повтор после OOM должен дать ту же картинку.
+        return pipe(**kwargs, generator=self._torch.Generator().manual_seed(seed), output="images")
+
+    def _release(self, exc: BaseException) -> None:
+        """Traceback упавшей генерации держит фреймы пайплайна со всеми тензорами — без очистки
+        после первого OOM видеопамять не освобождается и падают все следующие генерации."""
+        traceback.clear_frames(exc.__traceback__)
+        gc.collect()
+        self._torch.cuda.empty_cache()
+
+
+def resolve_lora_source(source: str) -> tuple[str, str | None]:
+    """'owner/repo' | 'owner/repo/путь/файл.safetensors' | URL Hugging Face | локальный путь → (repo_or_path, weight_name)."""
+    source = source.strip()
+    if not source:
+        raise ValueError("Укажите LoRA: путь, owner/repo или ссылку на Hugging Face")
+    if Path(source).expanduser().exists():
+        path = Path(source).expanduser()
+        return (str(path.parent), path.name) if path.is_file() else (str(path), None)
+    m = re.match(r"https?://huggingface\.co/([^/]+/[^/]+)/(?:resolve|blob)/[^/]+/(.+?)(?:\?.*)?$", source)
+    if m:
+        return m.group(1), m.group(2)
+    if source.startswith("http"):
+        raise ValueError("Поддерживаются ссылки на файлы Hugging Face (…/resolve/main/файл.safetensors) "
+                         "или локальные пути")
+    parts = source.split("/")
+    if len(parts) >= 3:
+        return "/".join(parts[:2]), "/".join(parts[2:])
+    return source, None
+
+
+class MockBackend:
+    """Имитирует генерацию: картинка нужного размера с текстом запроса и миниатюрами референсов."""
+
+    is_mock = True
+    description = "ЗАГЛУШКА — модель не загружена, картинки ненастоящие"
+    PREVIEW_MAX_SIDE = 768
+
+    def __init__(self) -> None:
+        self.loras: dict[str, tuple[str, str | None]] = {}
+        self._loaded = {"distilled"}
+
+    @property
+    def models(self) -> list[str]:
+        return list(REPOS)
+
+    def is_loaded(self, model: str) -> bool:
+        return model in self._loaded
+
+    def ensure_model(self, model: str) -> None:
+        self._loaded.add(model)
+
+    def add_lora(self, source: str, name: str | None = None) -> str:
+        repo_or_path, weight_name = resolve_lora_source(source)
+        name = name or re.sub(r"[^A-Za-z0-9_]", "_", Path(weight_name or repo_or_path).stem)[:40] or "lora"
+        self.loras[name] = (repo_or_path, weight_name)
+        return name
+
+    def remove_loras(self) -> None:
+        self.loras.clear()
+
+    def generate(self, req: GenRequest, progress: ProgressFn | None = None) -> list[Image.Image]:
+        width, height = req.resolved_size()
+        scale = min(1.0, self.PREVIEW_MAX_SIDE / max(width, height))
+        pw, ph = max(64, int(width * scale)), max(64, int(height * scale))
+        for step in range(req.steps):
+            time.sleep(0.03)
+            if progress:
+                progress((step + 1) / req.steps, "Денойзинг (заглушка)")
+        self._loaded.add(req.model)
+
+        results = []
+        for n in range(req.num_images):
+            hue = (req.seed * 37 + n * 61) % 255
+            canvas = Image.new("RGB", (pw, ph), (hue, 70, 255 - hue))
+            thumb_side = max(32, min(pw, ph) // 6)
+            for i, ref in enumerate(req.images):
+                thumb = ref.convert("RGB").copy()
+                thumb.thumbnail((thumb_side, thumb_side))
+                canvas.paste(thumb, (8 + i * (thumb_side + 4), ph - thumb.height - 8))
+            lines = [
+                f"MOCK #{n + 1}  {width}x{height}  seed={req.seed}  steps={req.steps}  {req.model}",
+                f"refs={len(req.images)}  cfg={req.guidance if req.model == 'base' else '-'}"
+                f"  loras={','.join(f'{a}:{w}' for a, w in req.loras) or '-'}",
+                "",
+                *_wrap(req.prompt, max(20, pw // 8)),
+            ]
+            draw = ImageDraw.Draw(canvas)
+            font = ImageFont.load_default(size=max(11, pw // 50))
+            draw.multiline_text((10, 10), "\n".join(lines[:24]), fill=(255, 255, 255), font=font,
+                                stroke_width=2, stroke_fill=(0, 0, 0))
+            results.append(canvas)
+        return results
+
+
+def _wrap(text: str, width: int) -> list[str]:
+    words, lines, line = text.split(), [], ""
+    for word in words:
+        if len(line) + len(word) + 1 > width:
+            lines.append(line)
+            line = word
+        else:
+            line = f"{line} {word}".strip()
+    return lines + [line] if line else lines
+
+
+def load_backend() -> KleinBackend | MockBackend:
+    if os.environ.get("KLEIN_MOCK") == "1":
+        return MockBackend()
+    try:
+        import torch
+    except ImportError:
+        print("[backend] torch не установлен — работаю в режиме заглушки")
+        return MockBackend()
+    if not torch.cuda.is_available():
+        print("[backend] CUDA недоступна — работаю в режиме заглушки (KLEIN_MOCK=1 делает это явно)")
+        return MockBackend()
+    return KleinBackend()

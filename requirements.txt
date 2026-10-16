@@ -1,0 +1,14 @@
+# GPU-сервер (CUDA). Для отладки интерфейса без видеокарты достаточно requirements-mock.txt.
+torch>=2.6
+torchvision  # процессоры Qwen3-VL (энкодер) и Qwen3.5 (апсемплер) без него не загружаются
+transformers>=5.8.1  # Qwen3_5ForConditionalGeneration — апсемплер промптов
+# Модульный пайплайн FLUX 3 Image Klein есть только в main. Зафиксирован коммит от 2026-10-15.
+diffusers @ git+https://github.com/huggingface/diffusers@d42ebf9c6e0b46103b74283f5324357a67acaa04
+accelerate
+peft>=0.17  # LoRA
+huggingface_hub
+gradio>=6.28,<7
+pillow>=10.1
+
+# Апсемплер на отдельном vLLM-сервере (KLEIN_UPSAMPLER=server, необязательно)
+openai
